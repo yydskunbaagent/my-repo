@@ -131,3 +131,54 @@ def test_case7_mask_text_is_idempotent():
     """已掩码文本再过一遍结果不变（渲染器重复调用无副作用）。"""
     once = mask_text("Authorization: Bearer sk-abcdef1234567890")
     assert mask_text(once) == once
+
+
+# ---- 8：TASK-007 masking 三处补全 ---------------------------------------------
+#
+# 实测缺口：小写 bearer、GitHub Fine-grained PAT、x-auth-token / private-token 头。
+
+
+def test_task007_lowercase_bearer_masked():
+    """小写裸 token：bearer mysecrettoken123 -> 掩码（(?i) 圈住 bearer 字面量）。"""
+    out = mask_text("bearer mysecrettoken123")
+    assert "mysecrettoken123" not in out, "token 原文不得出现在输出里"
+    assert out == "bearer myse***23"
+
+
+def test_task007_bearer_prefix_case_variants_masked():
+    """大小写混排的 bearer 前缀同样命中；组结构保持（scheme 前缀原样保留）。"""
+    out = mask_text("BEARER mysecrettoken123")
+    assert out == "BEARER myse***23"
+    out = mask_text("Bearer mysecrettoken123")
+    assert out == "Bearer myse***23"
+
+
+def test_task007_github_fine_grained_pat_masked():
+    """GitHub Fine-grained PAT：github_pat_ 前缀 -> 掩码。"""
+    token = "github_pat_11ABCdefGHIjklMNOpqrSTUvwx1234567890"
+    out = mask_text(f"推送用 {token} 验证")
+    assert token not in out, "PAT 原文不得出现在输出里"
+    assert "gith***90" in out
+
+
+def test_task007_x_auth_token_header_masked():
+    """X-Auth-Token 头 -> 整值掩码（name 原样保留）。"""
+    out = mask_text("X-Auth-Token: abcdef1234567890")
+    assert "abcdef1234567890" not in out
+    assert out == "X-Auth-Token: abcd***90"
+
+
+def test_task007_private_token_header_masked():
+    """Private-Token 头（GitLab PAT 形态）-> 整值掩码。"""
+    out = mask_text("Private-Token: abcdef1234567890")
+    assert "abcdef1234567890" not in out
+    assert out == "Private-Token: abcd***90"
+
+
+def test_task007_new_headers_case_insensitive_and_idempotent():
+    """新头名/小写 bearer 掩码后幂等：掩码产物含 * 不再命中任何模式。"""
+    once = mask_text("x-auth-token: abcdef1234567890\nbearer mysecrettoken123")
+    assert mask_text(once) == once
+    assert "x-auth-token: abcd***90" in once
+    assert "bearer myse***23" in once
+    assert "abcdef1234567890" not in once and "mysecrettoken123" not in once

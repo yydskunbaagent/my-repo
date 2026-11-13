@@ -34,3 +34,9 @@
 ## 008 正负对照只约束主动 PoC 通道
 - 理由：被动观察没有"清理动作"，硬套正负对照会卡死状态机（只读探测永远 NOT_RUN）
 - 拆两条通道：被动（两路独立特征交叉印证，上限 observed）/ 主动 PoC（正负对照+清理，才可 confirmed）
+
+## 009 域名目标网络层放行 = 精确"IP×端口"二元组；内联执行类别性拦截（TASK-007）
+- 理由：allow_domains4/6 与 allow_ports 两个独立集合的实际放行面是笛卡尔积——授权 a.com:80 + b.com:8080 会放行 a.com:8080；改 allow_pairs4/6（ipv4_addr . inet_service）后域名目标只放行授权组合
+- 代价：allow_domains4/6 集合及其喂入随之删除；scope_feed 不带 --feed-pairs/--feed-ports 时不喂任何集合（喂集动作显式化，防误跑出半套放行条目）
+- netrange 目标（IP/CIDR）无域名语义，保留 ranges×ports 组合宽放行
+- 内联代码（-c/-e/--eval/-m 任一参数或解释器交互模式）同理类别性拦截（inline_code_execution）：目标校验对"可见合法目标 + 隐藏 sink"无能为力

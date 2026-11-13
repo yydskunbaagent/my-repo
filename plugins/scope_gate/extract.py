@@ -60,6 +60,10 @@ _DOS = re.compile(r"(?:\b--flood\b|\bslowloris\b|\bhping3\b|\bgoldeneye\b|\b--ra
 
 _SCRIPT_INTERPRETERS = frozenset({"bash", "sh", "zsh", "dash", "python", "python3",
                                   "pwsh", "powershell", "node", "perl", "ruby"})
+# 内联执行形态（TASK-007）：代码以参数形式传给解释器，或解释器交互模式。
+# 内联代码里"可见合法目标 + 隐藏 sink"（如 'http://'+'x'+'.com' 拼接）无法
+# 静态提取，只能类别性拦截，不能靠目标校验兜底。
+_INLINE_EXEC_FLAGS = frozenset({"-c", "-e", "--eval", "-m"})
 
 # 委派类工具：父 Agent 把子任务文本转交子 Agent。文本里提得出目标就按目标判，
 # 提不出目标不算解析失败——子任务的出网动作由子 Agent 的门禁把关（TASK-005 缺陷 1）。
@@ -92,6 +96,7 @@ class Analysis:
     targets: Tuple[Target, ...] = ()
     command: str = ""
     script_path: str = ""
+    inline_eval: bool = False    # 解释器内联执行/交互模式（TASK-007：类别性拦截）
     forbidden: str = ""          # 非空表示命中违规类别（dos/exfil/persistence/lateral）
     parse_error: str = ""
     notes: List[str] = field(default_factory=list)
@@ -168,6 +173,22 @@ def analyze_terminal(command: str) -> Analysis:
                 script_path = arg
                 break
 
+    # 内联执行判定（TASK-007）：解释器 + -c/-e/--eval/-m 任一参数，或除解释器外
+    # 无任何参数（交互模式）。逐段判定——`curl a.com && python3 -c '...'` 的整体
+    # 首词是 curl，只看整条命令首词会漏掉后段的内联逃逸。
+    inline_eval = False
+    for seg in _segments(cmd):
+        if _first_token(seg) not in _SCRIPT_INTERPRETERS:
+            continue
+        try:
+            parts = shlex.split(seg, posix=not os.name == "nt")
+        except ValueError:
+            parts = seg.split()
+        rest = parts[1:]
+        if not rest or any(arg in _INLINE_EXEC_FLAGS for arg in rest):
+            inline_eval = True
+            break
+
     targets: List[Target] = []
     seen: set[Tuple[str, str]] = set()
     for seg in _segments(cmd):
@@ -182,6 +203,7 @@ def analyze_terminal(command: str) -> Analysis:
         targets=tuple(targets),
         command=cmd,
         script_path=script_path,
+        inline_eval=inline_eval,
         forbidden=forbidden,
     )
 

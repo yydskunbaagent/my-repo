@@ -211,6 +211,16 @@ class ScopeGate:
                 f"或使用预先登记并上报目标的 wrapper。",
             )
 
+        # 内联代码执行一律拒绝（TASK-007）：python -c / bash -c / 交互模式把代码
+        # 藏在参数里，"可见合法目标 + 隐藏 sink"（如拼接出的 URL）无法静态校验，
+        # 门禁只看到合法目标就放行会让隐藏 sink 逃过应用层。
+        if analysis.inline_eval:
+            return Decision(
+                DecisionKind.BLOCK, "inline_code_execution",
+                "[scope-gate] 被拒绝：扫描节点不允许内联代码执行，请使用预授权的原子工具。"
+                "内联形态（-c/-e/--eval/-m 或交互模式）里的真实目标无法在命令行静态校验。",
+            )
+
         resolved: Dict[str, Tuple[str, ...]] = {}
         unresolvable = []
         for t in analysis.targets:

@@ -15,6 +15,7 @@ import pytest
 
 from conftest import FakeResolver
 from scope_gate.engine import is_blocked_network
+from scope_gate.extract import analyze_terminal
 from scope_gate.gate import GateConfig, ScopeGate
 from scope_gate.models import DecisionKind
 
@@ -259,3 +260,101 @@ def test_delegate_tool_name_case_insensitive(tmp_path):
                      {"task": "分析刚才的输出"})
     assert d.kind is DecisionKind.ALLOW
     assert d.code == "delegate_no_target"
+
+
+# ---- TASK-007 任务 1：解释器内联执行的类别性拦截 ------------------------------
+#
+# 内联代码（python3 -c / bash -c / 交互模式）里"可见合法目标 + 隐藏 sink"无法
+# 静态提取，不能靠目标校验兜底，只能按形态类别性拦截。scope 用例里目标全合法，
+# 才能证明拦截依据是"内联形态"本身而不是目标越界。
+
+
+def _inline_scope():
+    """目标全合法的最小 scope：yyds520.online 带端口授权。"""
+    return _scope_dict([
+        {"kind": "domain", "value": "yyds520.online", "ports": [80, 443]},
+    ])
+
+
+def test_task007_python_dash_c_blocked_inline(tmp_path):
+    """验收 1：python3 -c 里目标全合法 -> 仍 block inline_code_execution。"""
+    d = _decide(tmp_path, _inline_scope(), {"yyds520.online": ("8.8.8.8",)},
+                "python3 -c \"import urllib.request; "
+                "urllib.request.urlopen('https://yyds520.online')\"")
+    assert d.is_block
+    assert d.code == "inline_code_execution"
+    assert "内联代码执行" in d.message
+    assert "预授权的原子工具" in d.message
+
+
+def test_task007_bash_dash_c_blocked_inline(tmp_path):
+    """验收 2：bash -c 'curl http://10.20.30.4' -> block inline_code_execution
+    （内联拦截先于目标判定，隐藏 sink 轮不到私网判定兜底）。"""
+    d = _decide(tmp_path, _inline_scope(), {}, "bash -c 'curl http://10.20.30.4'")
+    assert d.is_block
+    assert d.code == "inline_code_execution"
+
+
+def test_task007_file_form_keeps_script_execution(tmp_path):
+    """验收 3：纯文件形态 python3 /opt/scan.py -> 既有 script_execution 不回归。"""
+    d = _decide(tmp_path, _inline_scope(), {}, "python3 /opt/scan.py")
+    assert d.is_block
+    assert d.code == "script_execution"
+
+
+def test_task007_plain_tool_command_allowed(tmp_path):
+    """验收 4：curl 直连 scope 内目标 -> 放行，不误伤正常原子工具命令。"""
+    d = _decide(tmp_path, _inline_scope(), {"yyds520.online": ("8.8.8.8",)},
+                "curl https://yyds520.online/")
+    assert d.kind is DecisionKind.ALLOW
+    assert d.code == "ok"
+
+
+def test_task007_interpreter_interactive_mode_blocked(tmp_path):
+    """除解释器外无任何参数 = 交互模式，同样是代码注入通道 -> block。"""
+    d = _decide(tmp_path, _inline_scope(), {}, "python3")
+    assert d.is_block
+    assert d.code == "inline_code_execution"
+
+
+def test_task007_node_dash_e_blocked(tmp_path):
+    """node -e 内联形态同样命中（-e 在内联形态清单里）。"""
+    d = _decide(tmp_path, _inline_scope(), {"yyds520.online": ("8.8.8.8",)},
+                "node -e \"require('http').get('https://yyds520.online')\"")
+    assert d.is_block
+    assert d.code == "inline_code_execution"
+
+
+def test_task007_inline_in_later_segment_blocked(tmp_path):
+    """组合命令后段藏内联逃逸也要拦：curl 合法 && python3 -c。"""
+    d = _decide(tmp_path, _inline_scope(), {"yyds520.online": ("8.8.8.8",)},
+                "curl https://yyds520.online/ && python3 -c \"urlopen('https://yyds520.online')\"")
+    assert d.is_block
+    assert d.code == "inline_code_execution"
+
+
+def test_task007_curl_dash_c_not_inline(tmp_path):
+    """不误伤：curl 的 -c（cookie jar）不是内联执行，正常走目标校验。"""
+    d = _decide(tmp_path, _inline_scope(), {"yyds520.online": ("8.8.8.8",)},
+                "curl -c cookies.txt https://yyds520.online/")
+    assert d.kind is DecisionKind.ALLOW
+
+
+def test_task007_delegate_path_not_affected(tmp_path):
+    """delegate_task 不走 terminal 路径：子任务文本提到 -c 不触发内联拦截。"""
+    d = _decide_tool(tmp_path, _inline_scope(), {}, "delegate_task",
+                     {"task": "用 python3 -c '...' 对 yyds520.online 做站点指纹识别"})
+    assert d.kind is DecisionKind.ALLOW
+
+
+def test_task007_analysis_inline_eval_flag():
+    """Analysis 字段语义：内联形态置位；文件形态只置 script_path。"""
+    a = analyze_terminal("python3 -c 'print(1)'")
+    assert a.inline_eval is True
+    assert a.script_path == ""
+    b = analyze_terminal("bash scan.sh")
+    assert b.inline_eval is False
+    assert b.script_path == "scan.sh"
+    c = analyze_terminal("curl https://yyds520.online/")
+    assert c.inline_eval is False
+    assert c.script_path == ""

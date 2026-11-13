@@ -4,9 +4,11 @@
 里常带 Authorization/Cookie/Token——原样渲染进报告等于二次泄露。本模块用
 纯标准库正则对三类模式做统一掩码，渲染器（render.py）在输出前调用：
 
-  - Header 形态：Authorization/Cookie/Set-Cookie/X-Api-Key 的值
-    （name 不分大小写；值为 Bearer/Basic 等 scheme 开头时保留 scheme，只掩凭据）
-  - Token 形态：sk-/em-sk-/ghp_ 前缀串、Bearer 后随 token、三段式 JWT（eyJ 开头）
+  - Header 形态：Authorization/Cookie/Set-Cookie/X-Api-Key/X-Auth-Token/
+    Private-Token 的值（name 不分大小写；值为 Bearer/Basic 等 scheme 开头时
+    保留 scheme，只掩凭据）
+  - Token 形态：sk-/em-sk-/ghp_/github_pat_ 前缀串、Bearer 后随 token
+    （不分大小写）、三段式 JWT（eyJ 开头）
   - URL 查询串：token/key/secret/password/api_key 参数值
 
 掩码规则：保留前 4 后 2 字符，中间换 ***；总长 <= 8 全掩码。掩码只少不多：
@@ -23,9 +25,11 @@ from typing import Match
 _MASKED = "***"
 
 # Header 形态：name 不分大小写，值取"冒号后整行"（HTTP 头按行界定）。
-# set-cookie 必须排在 cookie 之前，避免同一起点被短 alternatives 抢先。
+# set-cookie 必须排在 cookie 之前，避免同一起点被短 alternatives 抢先；
+# x-auth-token / private-token 为 TASK-007 实测缺口补全。
 _HEADER_RE = re.compile(
-    r"(?i)\b(set-cookie|authorization|x-api-key|cookie)\s*:\s*([^\r\n]+)"
+    r"(?i)\b(set-cookie|x-auth-token|authorization|x-api-key|private-token|cookie)"
+    r"\s*:\s*([^\r\n]+)"
 )
 
 # Header 值里的 scheme 前缀（RFC 7235 credentials）：保留 scheme，只掩后面的凭据。
@@ -33,10 +37,15 @@ _SCHEME_RE = re.compile(r"(?i)^(bearer|basic|digest|negotiate)\s+(.+)$")
 
 # Token 形态。JWT 要求第二段同样以 eyJ 开头（payload 是 JSON，首两字节恒为 eyJ）。
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
-# em-sk- 排在 sk- 之前，否则 sk- 会把 em-sk- 的后半截单独掩掉。
-_PREFIXED_RE = re.compile(r"\b(?:em-sk|sk)-[A-Za-z0-9_-]{8,}")
+# em-sk- 排在 sk- 之前，否则 sk- 会把 em-sk- 的后半截单独掩掉；
+# github_pat_ 为 GitHub Fine-grained PAT（TASK-007），分隔符是下划线，单独一个分支。
+_PREFIXED_RE = re.compile(
+    r"\b(?:em-sk|sk)-[A-Za-z0-9_-]{8,}|\bgithub_pat_[A-Za-z0-9_]{8,}"
+)
 _GHP_RE = re.compile(r"\bghp_[A-Za-z0-9]{8,}")
-_BEARER_RE = re.compile(r"\b(Bearer\s+)([A-Za-z0-9._-]{8,})")
+# (?i) 只圈住 bearer 字面量（TASK-007：小写形态必须命中）；两个捕获组的
+# 结构保持不变——_mask_bearer 依赖 group(1)=前缀、group(2)=token。
+_BEARER_RE = re.compile(r"\b((?i:bearer)\s+)([A-Za-z0-9._-]{8,})")
 
 # URL 查询串：参数名不分大小写；值到 & 或空白为止。
 _QUERY_RE = re.compile(

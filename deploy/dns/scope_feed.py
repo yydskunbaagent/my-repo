@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
-"""把 scope.yaml 授权域名的解析结果喂进 nftables 动态集合。
+"""把 scope.yaml 授权目标的放行条目喂进 nftables 动态集合。
 
 扫描节点（deploy/nftables/scan-node.nft，inet hermes_scan 表）默认拒绝一切出站，
-仅放行到受控解析器的 DNS，以及到 allow_domains4/6（动态集合）、allow_ranges4/6
-（静态网段集合）地址的 TCP 授权端口（allow_ports 集合）。本脚本把 scope 中
-kind: domain 的目标经受控解析器（--resolver）解析出的公网地址喂进动态集合；
+仅放行到受控解析器的 DNS，以及两类授权条目（TASK-007 拆分的两条路径）：
+  - 域名目标：kind: domain 经受控解析器（--resolver）解析出的公网地址 × 该目标
+    声明端口 的精确二元组（allow_pairs4/6 动态集合）。地址与端口绑定为单一条目，
+    杜绝授权 a.com:80 + b.com:8080 时网络层实际放行 a.com:8080 的交叉放行
+    （旧 allow_domains4/6 × allow_ports 组合的实际放行面是两者的笛卡尔积）。
+  - netrange 目标：静态网段集合 allow_ranges4/6 × 授权端口并集 allow_ports 的
+    组合（IP/CIDR 无域名语义，ranges 由人工按授权记录维护）。
 条目带 timeout，到期自动失效，需按 --ttl 的量级周期性重跑（systemd timer 等）。
 
-端口喂入（TASK-006）：默认不喂端口（向后兼容）；带 --feed-ports 时收集 scope
-中所有目标（domain/ip/cidr）ports 字段的并集，一条命令喂进 allow_ports（条目
-同样带 --ttl 过期）。scope 无任何 ports 声明时集合保持为空：forward 链的端口
-放行规则全部不命中，等于没有任何扫描端口放行（fail closed）。
+二元组喂入（TASK-007）：带 --feed-pairs 时对每个 kind: domain 目标解析并逐端口
+喂入；ports 缺省的目标按 80,443 处理并打日志说明假设。--dry-run 照常只打印。
+
+端口喂入（TASK-006）：带 --feed-ports 时收集 scope 中所有目标（domain/ip/cidr）
+ports 字段的并集，一条命令喂进 allow_ports（服务 netrange 目标的 ranges×ports
+路径）。scope 无任何 ports 声明时集合保持为空：netrange 路径的端口放行规则
+全部不命中（fail closed）。不带任何 feed 参数时不做解析、不喂任何集合——仅
+校验 scope 与授权窗口（喂集动作必须显式选择，避免误跑产生半套放行条目）。
 
 fail-closed 语义：
   - scope 加载/校验失败、授权窗口未开始或已结束 -> 报错退出（rc=2），一条不喂
+  - 未指定 --feed-pairs/--feed-ports -> 不喂任何集合（rc=0，显式自检）
   - 域名解析失败 -> 打印警告并跳过（解析不出的域名自然没有放行条目）
   - 解析结果落在私网/保留段 -> 跳过并警告（复用
     plugins/scope_gate/engine.is_blocked_network，与门禁引擎的
     private_network_resolution 判定口径一致）
   - 单域名解析地址数超过 engine.MAX_IPS_PER_DOMAIN -> 疑似泛解析，整体跳过
 
-地址只处理 kind: domain 目标；ip/cidr 目标属于静态集合 allow_ranges，按授权
-流程人工维护，脚本不碰（--feed-ports 收集的端口并集则来自全部目标，含
-ip/cidr——端口与地址在 nft 侧是两个独立集合，须同时命中才会放行）。
+喂入只处理 kind: domain 目标（二元组）；ip/cidr 目标属于静态集合 allow_ranges，
+按授权流程人工维护，脚本不碰（--feed-ports 收集的端口并集则来自全部目标，含
+ip/cidr——netrange 目标没有域名语义，靠 ranges×ports 组合放行）。
 include_subdomains 的子域不在喂入范围：子域解析结果不会
 进集合，nft 层自然拒绝（DNS 层由 unbound 的 transparent 子树放行，网络层兜底）。
 
@@ -32,9 +41,9 @@ DNS 查询只用标准库 socket：直接向受控解析器发 UDP 报文（RFC1
 跳过——解析器不可达时零放行条目。
 
 用法：
-    python3 scope_feed.py --scope /etc/hermes/scope.yaml               # 实际喂入（root + nft）
-    python3 scope_feed.py --scope engagement-demo/scope.yaml --dry-run # 只打印将执行的命令
-    python3 scope_feed.py --scope /etc/hermes/scope.yaml --feed-ports  # 地址 + 授权端口一起喂
+    python3 scope_feed.py --scope /etc/hermes/scope.yaml --feed-pairs               # 实际喂入（root + nft）
+    python3 scope_feed.py --scope engagement-demo/scope.yaml --feed-pairs --dry-run # 只打印将执行的命令
+    python3 scope_feed.py --scope /etc/hermes/scope.yaml --feed-pairs --feed-ports  # 二元组 + 授权端口一起喂
 
 退出码：0 成功（解析失败跳过属设计内行为，只警告）；1 有条目 nft 执行失败；
 2 fail-closed（scope 无效 / 授权窗口外 / 参数非法 / nft 缺失）。
@@ -64,14 +73,14 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from plugins.scope_gate.engine import MAX_IPS_PER_DOMAIN, is_blocked_network
-from plugins.scope_gate.models import Engagement
+from plugins.scope_gate.models import Engagement, Target
 from plugins.scope_gate.scope import ScopeStore
 
 logger = logging.getLogger("scope_feed")
 
 DEFAULT_TABLE = "hermes_scan"
-DEFAULT_SET4 = "allow_domains4"
-DEFAULT_SET6 = "allow_domains6"
+DEFAULT_SET_PAIRS4 = "allow_pairs4"
+DEFAULT_SET_PAIRS6 = "allow_pairs6"
 DEFAULT_SET_PORTS = "allow_ports"
 DEFAULT_TTL_SECONDS = 300
 DEFAULT_RESOLVER = "10.10.0.53"
@@ -294,47 +303,73 @@ def _feed_ports(args: argparse.Namespace, ports: List[int]) -> int:
 # 喂入 nftables
 # ---------------------------------------------------------------------------
 
-def _nft_add_element(table: str, set_name: str, ip: str, ttl: int) -> List[str]:
-    """单条 nft 命令，参数列表形式（不经 shell 拼接）。"""
+def _nft_add_pair(table: str, set_name: str, ip: str, port: int, ttl: int) -> List[str]:
+    """单条 nft 命令（"IP . 端口"二元组），参数列表形式（不经 shell 拼接）。"""
     return ["nft", "add", "element", "inet", table, set_name,
-            f"{{ {ip} timeout {ttl}s }}"]
+            f"{{ {ip} . {port} timeout {ttl}s }}"]
 
 
-def _feed_addresses(args: argparse.Namespace, name: str, source: str,
-                    v4: list, v6: list) -> int:
-    """喂入（或打印）一个域名的全部地址，返回 nft 执行失败的条目数。"""
+def _target_ports(target: Target) -> Tuple[List[int], bool]:
+    """目标的授权端口列表；ports 缺省按 80,443 处理。
+
+    返回 (端口列表, 是否使用了缺省假设)——缺省假设必须打日志说明，
+    因为它放宽了 nft 放行面，操作员应当知情。
+    """
+    if target.ports:
+        return sorted(set(target.ports)), False
+    return [80, 443], True
+
+
+def _feed_target_pairs(args: argparse.Namespace, name: str, source: str,
+                       v4: list, v6: list, ports: List[int],
+                       seen: set[Tuple[str, str, int]]) -> int:
+    """喂入（或打印）一个域名"解析地址 × 授权端口"的全部二元组。
+
+    返回 nft 执行失败的条目数。seen 跨目标去重：多域名解析到同一 IP:端口
+    （同宿主多域名 / CDN）时只喂一次——nft 元素本可幂等重加，去重只是省命令。
+    """
     failed = 0
-    for rtype, addrs, set_name in (("A", v4, args.set4), ("AAAA", v6, args.set6)):
+    for rtype, addrs, set_name in (("A", v4, args.pairs4), ("AAAA", v6, args.pairs6)):
         for addr in addrs:
             if is_blocked_network(addr):
                 logger.warning("%s：解析到私网/保留地址 %s，跳过（与门禁引擎口径一致）",
                                name, addr)
                 continue
-            cmd = _nft_add_element(args.table, set_name, str(addr), args.ttl)
-            if args.dry_run:
-                print(f"# {name} {rtype} {addr}  [{source}]")
-                print(" ".join(shlex.quote(part) for part in cmd))
-            else:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-                if result.returncode != 0:
-                    detail = (result.stderr or result.stdout or "").strip()
-                    logger.error("%s：nft 添加 %s 失败（rc=%d）: %s",
-                                 name, addr, result.returncode, detail)
-                    failed += 1
+            for port in ports:
+                key = (set_name, str(addr), port)
+                if key in seen:
+                    continue
+                seen.add(key)
+                cmd = _nft_add_pair(args.table, set_name, str(addr), port, args.ttl)
+                if args.dry_run:
+                    print(f"# {name} {rtype} {addr} . {port}  [{source}]")
+                    print(" ".join(shlex.quote(part) for part in cmd))
                 else:
-                    logger.info("%s：已添加 %s（timeout %ds）", name, addr, args.ttl)
+                    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                    if result.returncode != 0:
+                        detail = (result.stderr or result.stdout or "").strip()
+                        logger.error("%s：nft 添加 %s . %d 失败（rc=%d）: %s",
+                                     name, addr, port, result.returncode, detail)
+                        failed += 1
+                    else:
+                        logger.info("%s：已添加 %s . %d（timeout %ds）",
+                                    name, addr, port, args.ttl)
     return failed
 
 
 def _feed(engagement: Engagement, args: argparse.Namespace) -> int:
-    """对每个授权域名解析并喂入/打印 nft 命令。返回 nft 执行失败的条目数。"""
+    """对每个 kind: domain 目标解析并把"IP . 授权端口"二元组喂入/打印。
+
+    返回 nft 执行失败的条目数。
+    """
     domains = engagement.domain_targets
     if not domains:
-        logger.info("scope 中没有 kind: domain 目标，无需喂入动态集合")
+        logger.info("scope 中没有 kind: domain 目标，无需喂入二元组集合")
         return 0
 
     resolver_down = False
     failed = 0
+    seen: set[Tuple[str, str, int]] = set()
 
     for target in domains:
         name = target.normalized
@@ -371,8 +406,13 @@ def _feed(engagement: Engagement, args: argparse.Namespace) -> int:
             logger.warning("%s：无 A/AAAA 记录，无放行条目", name)
             continue
 
-        logger.info("%s：[%s] 解析到 %d 个 IPv4 / %d 个 IPv6", name, source, len(v4), len(v6))
-        failed += _feed_addresses(args, name, source, v4, v6)
+        ports, defaulted = _target_ports(target)
+        if defaulted:
+            logger.warning("%s：目标未声明 ports，按 80,443 喂入二元组（缺省假设，"
+                           "建议在 scope 中显式声明端口以收紧放行面）", name)
+        logger.info("%s：[%s] 解析到 %d 个 IPv4 / %d 个 IPv6，授权端口 %s",
+                    name, source, len(v4), len(v6), ports)
+        failed += _feed_target_pairs(args, name, source, v4, v6, ports, seen)
 
     return failed
 
@@ -414,18 +454,21 @@ def _check_window(engagement: Engagement) -> bool:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="scope_feed",
-        description="把 scope.yaml 授权域名的解析结果喂进 nftables 动态集合"
-                    "（deploy/nftables/scan-node.nft 的 allow_domains4/allow_domains6）。",
+        description="把 scope.yaml 授权目标的放行条目喂进 nftables 动态集合"
+                    "（deploy/nftables/scan-node.nft 的 allow_pairs4/allow_pairs6"
+                    " 二元组集合与 allow_ports 端口集合）。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例：\n"
-            "  scope_feed.py --scope /etc/hermes/scope.yaml\n"
-            "  scope_feed.py --scope engagement-demo/scope.yaml --dry-run\n"
+            "  scope_feed.py --scope /etc/hermes/scope.yaml --feed-pairs\n"
+            "  scope_feed.py --scope engagement-demo/scope.yaml --feed-pairs --dry-run\n"
             "\n"
             "fail-closed：scope 无效或授权窗口外直接退出；域名解析失败仅警告并跳过，\n"
             "解析不出的域名不会产生任何放行条目。条目带 --ttl 自动过期，需周期重跑。\n"
-            "地址只处理 kind: domain 目标（ip/cidr 属静态集合 allow_ranges，人工维护）；\n"
-            "--feed-ports 的端口并集来自全部目标的 ports，不带该参数时不喂端口。\n"
+            "--feed-pairs 的二元组只处理 kind: domain 目标（ip/cidr 属静态集合\n"
+            "allow_ranges，人工维护）；--feed-ports 的端口并集来自全部目标的 ports\n"
+            "（服务 netrange 目标的 ranges×ports 路径）。不带任何 feed 参数时\n"
+            "不喂任何集合，仅校验 scope 与授权窗口。\n"
             "退出码：0 成功；1 有条目 nft 执行失败；2 fail-closed（scope 无效/窗口外）。\n"
         ),
     )
@@ -433,17 +476,20 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="scope.yaml 路径")
     parser.add_argument("--table", default=DEFAULT_TABLE,
                         help="nft 表名（默认 %(default)s）")
-    parser.add_argument("--set4", default=DEFAULT_SET4,
-                        help="IPv4 动态集合名（默认 %(default)s）")
-    parser.add_argument("--set6", default=DEFAULT_SET6,
-                        help="IPv6 动态集合名（默认 %(default)s）")
+    parser.add_argument("--pairs4", default=DEFAULT_SET_PAIRS4,
+                        help="IPv4 二元组集合名（默认 %(default)s）")
+    parser.add_argument("--pairs6", default=DEFAULT_SET_PAIRS6,
+                        help="IPv6 二元组集合名（默认 %(default)s）")
     parser.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS, metavar="SECONDS",
                         help="集合条目存活秒数（默认 %(default)s）")
     parser.add_argument("--resolver", default=DEFAULT_RESOLVER, metavar="IP",
                         help="受控解析器地址（默认 %(default)s）")
+    parser.add_argument("--feed-pairs", action="store_true",
+                        help="把 kind: domain 目标的『解析 IP . 授权端口』二元组喂进 "
+                             "allow_pairs4/6（TASK-007；ports 缺省按 80,443 喂入）")
     parser.add_argument("--feed-ports", action="store_true",
                         help="把 scope 中所有目标的 ports 并集喂进 allow_ports 集合"
-                             "（默认不喂端口，保持既有行为）")
+                             "（服务 netrange 目标的 ranges×ports 路径）")
     parser.add_argument("--dry-run", action="store_true",
                         help="只打印将执行的 nft 命令（stdout），不执行、不改集合")
     return parser
@@ -474,15 +520,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 engagement.window.start.isoformat(), engagement.window.end.isoformat(),
                 len(engagement.domain_targets))
 
-    if not args.dry_run and shutil.which("nft") is None:
+    if (args.feed_pairs or args.feed_ports) and not args.dry_run \
+            and shutil.which("nft") is None:
         logger.error("找不到 nft 可执行文件；实际喂入需在扫描节点以 root 运行（预览请加 --dry-run）")
         return 2
+    if not args.feed_pairs and not args.feed_ports:
+        logger.warning("未指定 --feed-pairs / --feed-ports：本次不喂任何集合"
+                       "（仅校验 scope 与授权窗口；喂集动作必须显式选择）")
 
     failed = 0
     if args.feed_ports:
-        # 端口喂入不依赖 DNS，放在地址喂入之前：dry-run 输出里第一段是确定性内容
+        # 端口喂入不依赖 DNS，放在二元组喂入之前：dry-run 输出里第一段是确定性内容
         failed += _feed_ports(args, _collect_ports(engagement))
-    failed += _feed(engagement, args)
+    if args.feed_pairs:
+        failed += _feed(engagement, args)
     if failed:
         logger.error("有 %d 个条目 nft 执行失败，请检查表/集合是否存在", failed)
         return 1
