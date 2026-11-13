@@ -1,0 +1,12 @@
+scope_path: scope.yaml
+audit_path: audit/decisions.jsonl
+rate_limit_db: audit/ratelimit.sqlite3
+
+# 除 scope.yaml 与 audit/ 之外，额外受保护的路径（文件或目录）
+# Agency 不得写入授权书、合同、客户原始数据等
+protected_paths:
+  - authorization.md
+
+dns_ttl: 300
+dns_timeout: 4.0
+allow_local_write: true

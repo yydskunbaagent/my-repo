@@ -1,0 +1,27 @@
+# 本机大文件克隆：不入库，克隆信息见 refs/README.md
+refs/
+
+# 本地会话与工作区数据
+.workbuddy/
+.probe/
+
+# 作业数据（法律证据与凭据，绝不入库）
+grants.yaml
+engagement*/
+evidence/
+audit/
+*.sqlite3*
+*.sqlite-shm
+*.sqlite-wal
+
+# 密钥与凭据
+.env
+*.pem
+*.key
+credentials*
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/

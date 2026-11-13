@@ -1,0 +1,10 @@
+name: scope-gate
+version: "1.0.0"
+description: >-
+  授权范围门禁：在每个工具执行前校验目标是否落在 engagement 的 scope 内。
+  拦截越界目标、脚本内嵌目标、云元数据地址与破坏性动作；exploit 类动作升级人工确认；
+  全量决策写入哈希链审计日志，并对每个主机做持久化限速。
+author: local
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
