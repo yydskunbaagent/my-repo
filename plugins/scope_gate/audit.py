@@ -117,6 +117,8 @@ class AuditLog:
                 if recorded_prev != prev:
                     return VerifyResult(
                         False, count, rec.get("seq"), "prev_hash 与上一条的 hash 不匹配（记录被增删或改写）")
+                # append 时 prev_hash 参与哈希，校验前必须还原，否则永远对不上
+                rec["prev_hash"] = recorded_prev
                 if _hash(prev, rec) != recorded_hash:
                     return VerifyResult(False, count, rec.get("seq"), "内容与自身 hash 不符")
                 prev = recorded_hash
