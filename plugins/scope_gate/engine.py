@@ -6,7 +6,7 @@
     2. 动作是否被禁止               -> forbidden 优先于 allowed
     3. 是否在时间窗内
     4. 动作是否在允许集内
-    5. 目标是否为空                 -> 空=解析失败=拒
+    5. 目标是否为空                 -> 空=解析失败=拒（委派类工具除外：空=交子层把关）
     6. 逐个目标：云元数据 / 排除项 / 范围 / 端口 / 解析结果（私网/保留段默认阻断）
     7. 速率与总量
     8. 高危动作升级人工确认
@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from ipaddress import IPv4Address, IPv6Address
 from typing import Iterable, List, Optional, Tuple
 
+from .extract import is_delegate_tool
 from .models import (
     Action,
     Decision,
@@ -202,6 +203,10 @@ def decide(
                       f"{head}\n被拒绝：无法从工具调用中确定目标（{parse_error}）。"
                       f"请把目标显式写在参数里（URL/IP/CIDR），不要藏在脚本内部。")
     if not targets:
+        # 委派类工具：子任务文本提不出可识别目标 -> 放行，交给子 Agent 的门禁把关
+        # （TASK-005 缺陷 1：从"不认识就拒"改为"提得出就按目标判，提不出才交子层"）
+        if is_delegate_tool(tool_name):
+            return Decision(DecisionKind.ALLOW, "delegate_no_target", "")
         return _block("no_target",
                       f"{head}\n被拒绝：未解析到任何目标。")
 

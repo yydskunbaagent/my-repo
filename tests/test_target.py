@@ -92,3 +92,45 @@ def test_cloud_metadata_detected(value):
 def test_port_preserved_on_target():
     t = make_target("app.example.com:8443")
     assert t.ports == (8443,)
+
+
+# ---- TASK-005 缺陷 2：裸文件名不是出网目标 ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cat robots.txt",
+        "ls -la notes.md",
+        "grep x data.csv",
+    ],
+)
+def test_bare_filename_not_a_target(cmd):
+    """两段式裸文件名（<label>.<常见后缀>）不得提取为域名目标。"""
+    assert extract_targets(cmd) == []
+
+
+def test_url_file_path_still_extracts_host():
+    """URL 里的文件路径不受影响：域名来自 URL host 部分。"""
+    targets = extract_targets("curl https://a.example.com/s/robots.txt")
+    assert {t.normalized for t in targets} == {"a.example.com"}
+
+
+def test_multilevel_host_with_file_path_still_extracts():
+    """多级域名 + 文件路径（无 scheme）仍提取 host 部分。"""
+    targets = extract_targets("curl cdn.example.com/file.txt")
+    assert {t.normalized for t in targets} == {"cdn.example.com"}
+
+
+def test_host_with_port_still_extracts():
+    """带端口的 host 不受文件名过滤影响。"""
+    targets = extract_targets("curl example.com:8080")
+    assert len(targets) == 1
+    assert targets[0].normalized == "example.com"
+    assert targets[0].ports == (8080,)
+
+
+def test_nmap_ip_command_unchanged():
+    """IP 扫描命令行为不变（回归锚点）。"""
+    targets = extract_targets("nmap -p443 10.20.30.4")
+    assert {t.normalized for t in targets} == {"10.20.30.4"}

@@ -61,6 +61,28 @@ _DOS = re.compile(r"(?:\b--flood\b|\bslowloris\b|\bhping3\b|\bgoldeneye\b|\b--ra
 _SCRIPT_INTERPRETERS = frozenset({"bash", "sh", "zsh", "dash", "python", "python3",
                                   "pwsh", "powershell", "node", "perl", "ruby"})
 
+# 委派类工具：父 Agent 把子任务文本转交子 Agent。文本里提得出目标就按目标判，
+# 提不出目标不算解析失败——子任务的出网动作由子 Agent 的门禁把关（TASK-005 缺陷 1）。
+DELEGATE_TOOL = "delegate_task"
+
+
+def is_delegate_tool(name: str) -> bool:
+    """是否委派类工具（不区分大小写）。"""
+    return (name or "").strip().lower() == DELEGATE_TOOL
+
+
+def _collect_strings(value: object, out: List[str]) -> None:
+    """递归展开 args 里的字符串值字段（dict/list 嵌套一律展开）。"""
+    if isinstance(value, str):
+        if value.strip():
+            out.append(value)
+    elif isinstance(value, dict):
+        for v in value.values():
+            _collect_strings(v, out)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            _collect_strings(v, out)
+
 
 @dataclass
 class Analysis:
@@ -188,6 +210,22 @@ def analyze_tool(tool_name: str, args: dict) -> Analysis:
 
     if name in _PASSIVE:
         return Analysis(Action.RECON_PASSIVE, notes=["passive"])
+
+    # 委派类工具：对子任务文本里的字符串字段跑目标提取。提不出目标不置
+    # parse_error——"不认识就拒"只适用于执行目标必判的工具（terminal/curl 类）。
+    if is_delegate_tool(name):
+        texts: List[str] = []
+        if isinstance(args, dict):
+            for v in args.values():
+                _collect_strings(v, texts)
+        blob = "\n".join(texts)
+        found = extract_targets(blob)
+        return Analysis(
+            Action.RECON_ACTIVE,
+            targets=tuple(found),
+            command=blob,
+            notes=["delegate"],
+        )
 
     if name.startswith("browser_") or name in NETWORK_TOOLS:
         target_text = ""

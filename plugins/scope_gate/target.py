@@ -45,6 +45,23 @@ _HOSTPORT_RE = re.compile(
     r"[a-zA-Z\u4e00-\u9fff]{2,})(?::(\d{1,5}))?(?![\w.\-])"
 )
 
+# 常见文件后缀（TASK-005 缺陷 2）：`cat robots.txt` 这类命令里的裸文件名
+# 会被两段式 host 正则当成域名，这里显式排除。
+_FILE_EXTS = frozenset({
+    "txt", "html", "htm", "js", "css", "json", "xml", "md", "log", "csv",
+    "yaml", "yml", "py", "sh", "conf", "ini", "pdf", "zip", "png", "jpg",
+})
+
+
+def _bare_filename(host: str) -> bool:
+    """host 是否为 `<label>.<文件后缀>` 的裸文件名（恰好两段、无上下文）。
+
+    只在 host[:port] 分支且未带端口时调用：URL host 由 scheme 分支处理，
+    带端口与多级域名（cdn.example.com）都不满足"恰好两段"，均不受影响。
+    """
+    parts = host.split(".")
+    return len(parts) == 2 and bool(parts[0]) and parts[1].lower() in _FILE_EXTS
+
 
 class TargetError(ValueError):
     """目标无法规范化。调用方应据此 fail closed。"""
@@ -264,9 +281,11 @@ def extract_targets(text: str) -> List[Target]:
         if dotted:
             add(Target(kind=TargetKind.IP, normalized=dotted, raw=token))
 
-    # 5) host[:port]
+    # 5) host[:port]（裸文件名如 robots.txt 不是出网目标，跳过）
     for m in _HOSTPORT_RE.finditer(text):
         host, port = m.group(1), m.group(2)
+        if not port and _bare_filename(host):
+            continue
         try:
             if port:
                 add(make_target(f"{host}:{port}"))
