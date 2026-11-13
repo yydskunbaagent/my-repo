@@ -1,10 +1,20 @@
 # 扫描作业拓扑声明（方案 §5.1/§5.2；声明用，不直接 docker compose up）。
 #
-#   reasoning —— network_mode: none，完全无出网；模型凭据只存在于该节点
-#   scanner   —— scannet 内部网络（internal: true），出网由宿主机
-#                deploy/nftables/scan-node.nft 的 forward 链默认拒绝、按 scope 放行
+# 三服务拓扑与出网语义（TASK-006 修订）：
+#   reasoning    —— 只接 reasoning-egress（internal: true），无直连出网；
+#                   只能到模型 API（全部经 egress-proxy），模型凭据只存在于该节点
+#   egress-proxy —— network_mode: host，绑定 reasoning-egress 网关 IP 10.20.0.1；
+#                   只能到模型 API（应用层 ACL 收敛端点；网络层放行由宿主机
+#                   output 链或另一张表管理，见 deploy/nftables/scan-node.nft 尾部）
+#   scanner      —— 只接 scannet（internal: false，普通 bridge），只能到授权目标
+#                   + 受控解析器（经宿主机 deploy/nftables/scan-node.nft 的
+#                   forward 链默认拒绝、按 scope 放行）
 #   受控解析器（unbound）部署在 scannet 的 10.10.0.53（deploy/dns/unbound.conf），
 #   不在本文件中声明（部署方式按 scan-node.nft 尾部"部署决策点"选型）
+#
+# 依赖：br_netfilter（bridge-nf-call-iptables=1）必须开启，否则 scannet 内
+# 容器间/桥内流量不经过 forward 链，nftables 门禁对这部分流量形同虚设
+# （跨网段出网流量始终经宿主机路由、必过 forward 链，不受此影响）。
 #
 # 红线：scanner 容器内不得挂载任何含模型凭据的路径（~/.hermes、API key、
 # 账号池配置等）——扫描节点不持有模型凭据，被打穿也拿不到账号池（方案 §5.1）。
@@ -13,12 +23,33 @@ services:
   reasoning:
     # 占位镜像：按 P0-B 验收时替换为实际推理镜像（Hermes + hermes-security）
     image: scratch
-    network_mode: none
+    networks:
+      - reasoning-egress
+    # 出网全部走 egress-proxy（reasoning-egress 里唯一可达的宿主机服务，
+    # 地址取下方 ipam 固定的网关 IP）。internal: true 兜底：客户端即便无视
+    # 代理直连，网络层也出不去；与 scannet 跨网络互不可达（docker 网络隔离
+    # + forward 链 policy drop 双重覆盖）。
+    environment:
+      HTTPS_PROXY: http://10.20.0.1:3128
+      NO_PROXY: localhost,127.0.0.1
     # 模型凭据与作业配置只存在于推理节点，且只读挂载
     volumes:
       - ~/.hermes:/hermes:ro
     # 本节点不安装 nmap/nuclei/httpx 等任何扫描工具；
     # 推理节点只产出结构化任务（JSON 文件/RPC），与扫描节点不共享 shell。
+
+  egress-proxy:
+    # 轻量转发代理占位：tinyproxy / squid，部署时替换为实际镜像与配置：
+    #   - 只监听 10.20.0.1:3128（host 网络下 bind 到 reasoning-egress 网关 IP，
+    #     不暴露到其他网卡；tinyproxy: Listen + Allow 10.20.0.0/24）
+    #   - 只转发到模型 API 端点：示例 open.bigmodel.cn:443（部署时按实际
+    #     provider 填；squid 用 dstdomain ACL、tinyproxy 用 ConnectPort/upstream
+    #     收敛，模型 API 之外的 CONNECT 一律拒绝）
+    #   - 到模型 API 的网络层放行不在 hermes_scan 表内：由宿主机 output 链或
+    #     另一张表管理（见 deploy/nftables/scan-node.nft 尾部"部署决策点"）
+    image: scratch
+    network_mode: host
+    # proxy 只转发 TLS 流量，不持有模型凭据，配置不含任何 upstream 凭据。
 
   scanner:
     # 占位镜像：按 P0-B 验收时替换为下面注释所述方式构建的镜像。镜像内安装：
@@ -42,8 +73,19 @@ services:
 
 networks:
   scannet:
-    internal: true
+    # TASK-006：internal: false（普通 bridge）。Docker 不再自带出网隔离，宿主机
+    # nftables forward 链成为唯一出网门禁（default-deny 语义不变）。
     ipam:
       config:
         # 网段与 nftables/unbound 配置对齐：受控解析器固定 10.10.0.53
         - subnet: 10.10.0.0/24
+  reasoning-egress:
+    # reasoning 专用受限网络：internal: true 使容器无法直连任何外部网络，
+    # 只能触达宿主机本机服务（即 egress-proxy）。
+    internal: true
+    ipam:
+      config:
+        # 网关 IP 写死，与 reasoning 的 HTTPS_PROXY、nftables 部署决策点里的
+        # reasoning -> egress-proxy input 放行保持一致
+        - subnet: 10.20.0.0/24
+          gateway: 10.20.0.1

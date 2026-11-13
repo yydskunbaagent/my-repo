@@ -1,11 +1,24 @@
 #!/usr/sbin/nft -f
 # 扫描节点网络策略：default-deny（默认拒绝）。
-# 语义依据：方案 §5.1/§5.2（docs/tasks/TASK-002.md）。
+# 语义依据：方案 §5.1/§5.2（docs/tasks/TASK-002.md）；TASK-006 修订拓扑语义。
+#
+# TASK-006 起的拓扑事实（deploy/docker-compose.scan.yml）：
+#   - scannet 改为普通 bridge（internal: false）：Docker 不再自带出网隔离，
+#     本文件 forward 链是 scanner 出网的唯一门禁，default-deny 语义不变。
+#     依赖 br_netfilter（bridge-nf-call-iptables=1）开启：同网段容器间流量
+#     （scanner -> 受控解析器 10.10.0.53）才会经过 forward 链受门禁约束，
+#     不开时这部分流量在桥内二层转发、绕过本链（跨网段出网流量始终经过 forward）。
+#   - reasoning-egress 仍为 internal: true：reasoning 无直连出网，模型 API 流量
+#     全部经宿主机上的 egress-proxy（network_mode: host），不经过本文件的
+#     forward 面——egress-proxy 到模型 API 的放行由宿主机 output 链或另一张表
+#     管理（见尾部"部署决策点"），本文件仍只管 forward 面。
 #
 # 放行条目的唯一来源是 scope 授权流程：
 #   - kind: domain   -> deploy/dns/scope_feed.py 把解析结果喂入 allow_domains4/6
 #                       （动态集合，条目带 timeout 自动过期，需按 TTL 周期重跑）
 #   - kind: ip/cidr  -> 人工写入 allow_ranges4/6（静态网段集合，须有授权记录）
+#   - 各目标 ports   -> scope_feed.py --feed-ports 把全部目标端口并集喂入
+#                       allow_ports（不带该参数时不喂端口，集合为空 = 端口全拒）
 # 本文件之外不存在任何"配置坏了就放行"的口子。
 #
 # 加载：nft -f /etc/nftables/scan-node.nft（root）。建议在 docker 启动前加载
@@ -42,17 +55,30 @@ table inet hermes_scan {
         flags interval
     }
 
+    # 授权端口集合（TASK-006）：scope 中所有目标 ports 字段的并集，由
+    # scope_feed.py --feed-ports 喂入，条目与地址条目同用 --ttl 过期——scope
+    # 停止续期后端口放行随之失效。type inet_service，无 interval：端口是离散
+    # 授权值，不存在"网段"语义。集合为空时下面四条放行规则全部不命中，等于
+    # 没有任何扫描端口放行（fail closed）。
+    set allow_ports {
+        type inet_service
+        flags timeout
+    }
+
     # 入站：只放行 lo 与已建立连接。扫描节点不对外提供任何服务。
     chain input {
         type filter hook input priority filter; policy drop;
         iifname "lo" accept comment "本机回环"
         ct state established,related accept comment "已建立连接的回包"
-        # 其余入站一律 policy drop
+        # 其余入站一律 policy drop（reasoning -> egress-proxy 的 input 放行
+        # 属部署决策点，见文件尾部，不在此默认放开）
     }
 
-    # 转发：scanner 容器（deploy/docker-compose.scan.yml）的全部出网经此链。
+    # 转发：scanner 容器（scannet，internal: false，deploy/docker-compose.scan.yml）
+    # 的全部出网经此链——compose 不再用 internal:true 隔离，本链是唯一出网门禁。
     # 依赖 docker 默认开启的 br_netfilter（bridge-nf-call-iptables=1），
     # 同网段容器间流量（scanner -> 受控解析器）同样经过本链。
+    # reasoning 所在 reasoning-egress（internal: true）无直连出网，不经本链。
     chain forward {
         type filter hook forward priority filter; policy drop;
         ct state established,related accept comment "已建立连接的回包"
@@ -65,33 +91,47 @@ table inet hermes_scan {
         udp dport 53 drop
         tcp dport 53 drop
 
-        # 2) 扫描流量：TCP 80/443 只允许到授权地址（域名动态集合 + 网段静态集合）。
-        ip  daddr @allow_domains4 tcp dport { 80, 443 } accept
-        ip  daddr @allow_ranges4  tcp dport { 80, 443 } accept
-        ip6 daddr @allow_domains6 tcp dport { 80, 443 } accept
-        ip6 daddr @allow_ranges6  tcp dport { 80, 443 } accept
+        # 2) 扫描流量：TCP 只允许到授权地址的授权端口。端口来自 scope 各目标
+        #    ports 字段的并集（scope_feed.py --feed-ports 喂入 allow_ports），
+        #    scope 授权的 8080/8443 不再被写死的 { 80, 443 } 静默拦下。
+        ip  daddr @allow_domains4 tcp dport @allow_ports accept
+        ip  daddr @allow_ranges4  tcp dport @allow_ports accept
+        ip6 daddr @allow_domains6 tcp dport @allow_ports accept
+        ip6 daddr @allow_ranges6  tcp dport @allow_ports accept
 
         # 3) 其余出站一律 policy drop：直连任意 IP 的探测、ICMP、UDP 等全不放过。
     }
 }
 
 # ---- 部署决策点（默认不启用，评审后放开）--------------------------------
-# unbound 采用转发模式（deploy/dns/unbound.conf 的 forward-zone），其自身对
-# 上游 1.1.1.1/8.8.8.8 的 53 查询同样经过 forward 链，会被上面"其余 DNS 全部
-# 丢弃"的规则挡下——转发模式因此无法工作。可选方案（任选其一）：
+# 1) egress-proxy（TASK-006 新增服务，network_mode: host）的网络放行不在本表：
+#    它到模型 API（示例 open.bigmodel.cn:443，部署时按实际 provider 填）的出站
+#    由宿主机 output 链或另一张表管理（本文件仍只管 forward 面；另一张表即便
+#    accept 也救不回本表 policy drop 丢弃的包，故 proxy 必须走 host 网络的
+#    output 面，或走不经本链的独立出网路径）。output 面按最小化收敛，示例
+#    （表名/地址部署时定）：
+#         nft add rule inet <proxy_egress表> output ip daddr <模型API地址> tcp dport 443 accept
+#    同时需为 reasoning -> egress-proxy 放开 input 面（本表 input policy drop
+#    会拦下它）：
+#         ip saddr 10.20.0.0/24 ip daddr 10.20.0.1 tcp dport 3128 accept
 #
-#   a) 仅放行受控解析器自身向上游发起的 DNS（对 forward 链最小改动，置于两条
-#      drop 之前；效果：只有 10.10.0.53 这一台可信机器可对外发 DNS）：
-#         ip saddr 10.10.0.53 udp dport 53 accept
-#         ip saddr 10.10.0.53 tcp dport 53 accept
+# 2) unbound 采用转发模式（deploy/dns/unbound.conf 的 forward-zone），其自身对
+#    上游 1.1.1.1/8.8.8.8 的 53 查询同样经过 forward 链，会被上面"其余 DNS 全部
+#    丢弃"的规则挡下——转发模式因此无法工作。可选方案（任选其一）：
 #
-#   b) 解析器上游改 DoT（tcp 853）并为 10.10.0.53 放行 tcp 853，
-#      明文 53 保持全拒（上游链路上不暴露查询内容）。
+#    a) 仅放行受控解析器自身向上游发起的 DNS（对 forward 链最小改动，置于两条
+#       drop 之前；效果：只有 10.10.0.53 这一台可信机器可对外发 DNS）：
+#          ip saddr 10.10.0.53 udp dport 53 accept
+#          ip saddr 10.10.0.53 tcp dport 53 accept
 #
-#   c) 解析器部署在宿主机 10.10.0.53：容器的 DNS 查询将命中 input 链
-#      （目的为本机地址），需在 input 链为 10.10.0.53 增加 53 放行
-#      （同样评审后加），并自行收敛宿主机 output 面。
+#    b) 解析器上游改 DoT（tcp 853）并为 10.10.0.53 放行 tcp 853，
+#       明文 53 保持全拒（上游链路上不暴露查询内容）。
+#
+#    c) 解析器部署在宿主机 10.10.0.53：容器的 DNS 查询将命中 input 链
+#       （目的为本机地址），需在 input 链为 10.10.0.53 增加 53 放行
+#       （同样评审后加），并自行收敛宿主机 output 面。
 #
 # 本文件刻意不设 output 基础链：默认拒绝覆盖容器转发面（forward）与入站面
-# （input）；宿主机自身出站（管理通道）另行评审收敛，不在此文件默认放开。
+# （input）；宿主机自身出站（管理通道、egress-proxy 到模型 API）另行评审收敛
+# （见决策点 1），不在此文件默认放开。
 # --------------------------------------------------------------------------

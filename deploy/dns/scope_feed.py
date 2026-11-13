@@ -2,10 +2,15 @@
 """把 scope.yaml 授权域名的解析结果喂进 nftables 动态集合。
 
 扫描节点（deploy/nftables/scan-node.nft，inet hermes_scan 表）默认拒绝一切出站，
-仅放行到受控解析器的 DNS 和到 allow_domains4/6（动态集合）、allow_ranges4/6
-（静态网段集合）的 TCP 80/443。本脚本把 scope 中 kind: domain 的目标经受控
-解析器（--resolver）解析出的公网地址喂进动态集合；条目带 timeout，到期自动
-失效，需按 --ttl 的量级周期性重跑（systemd timer 等）。
+仅放行到受控解析器的 DNS，以及到 allow_domains4/6（动态集合）、allow_ranges4/6
+（静态网段集合）地址的 TCP 授权端口（allow_ports 集合）。本脚本把 scope 中
+kind: domain 的目标经受控解析器（--resolver）解析出的公网地址喂进动态集合；
+条目带 timeout，到期自动失效，需按 --ttl 的量级周期性重跑（systemd timer 等）。
+
+端口喂入（TASK-006）：默认不喂端口（向后兼容）；带 --feed-ports 时收集 scope
+中所有目标（domain/ip/cidr）ports 字段的并集，一条命令喂进 allow_ports（条目
+同样带 --ttl 过期）。scope 无任何 ports 声明时集合保持为空：forward 链的端口
+放行规则全部不命中，等于没有任何扫描端口放行（fail closed）。
 
 fail-closed 语义：
   - scope 加载/校验失败、授权窗口未开始或已结束 -> 报错退出（rc=2），一条不喂
@@ -15,8 +20,10 @@ fail-closed 语义：
     private_network_resolution 判定口径一致）
   - 单域名解析地址数超过 engine.MAX_IPS_PER_DOMAIN -> 疑似泛解析，整体跳过
 
-仅处理 kind: domain 目标；ip/cidr 目标属于静态集合 allow_ranges，按授权流程
-人工维护，脚本不碰。include_subdomains 的子域不在喂入范围：子域解析结果不会
+地址只处理 kind: domain 目标；ip/cidr 目标属于静态集合 allow_ranges，按授权
+流程人工维护，脚本不碰（--feed-ports 收集的端口并集则来自全部目标，含
+ip/cidr——端口与地址在 nft 侧是两个独立集合，须同时命中才会放行）。
+include_subdomains 的子域不在喂入范围：子域解析结果不会
 进集合，nft 层自然拒绝（DNS 层由 unbound 的 transparent 子树放行，网络层兜底）。
 
 DNS 查询只用标准库 socket：直接向受控解析器发 UDP 报文（RFC1035 编解码在本文件
@@ -27,6 +34,7 @@ DNS 查询只用标准库 socket：直接向受控解析器发 UDP 报文（RFC1
 用法：
     python3 scope_feed.py --scope /etc/hermes/scope.yaml               # 实际喂入（root + nft）
     python3 scope_feed.py --scope engagement-demo/scope.yaml --dry-run # 只打印将执行的命令
+    python3 scope_feed.py --scope /etc/hermes/scope.yaml --feed-ports  # 地址 + 授权端口一起喂
 
 退出码：0 成功（解析失败跳过属设计内行为，只警告）；1 有条目 nft 执行失败；
 2 fail-closed（scope 无效 / 授权窗口外 / 参数非法 / nft 缺失）。
@@ -64,6 +72,7 @@ logger = logging.getLogger("scope_feed")
 DEFAULT_TABLE = "hermes_scan"
 DEFAULT_SET4 = "allow_domains4"
 DEFAULT_SET6 = "allow_domains6"
+DEFAULT_SET_PORTS = "allow_ports"
 DEFAULT_TTL_SECONDS = 300
 DEFAULT_RESOLVER = "10.10.0.53"
 
@@ -243,6 +252,44 @@ def _dedupe(addrs: list) -> list:
     return list(dict.fromkeys(addrs))
 
 
+def _collect_ports(engagement: Engagement) -> List[int]:
+    """收集 scope 中所有目标 ports 字段的并集（去重升序）。
+
+    不分目标类型：domain/ip/cidr 的 ports 都是显式授权的端口（parse_scope 已
+    校验为 1-65535 的 int）。端口集合独立于地址集合生效——nft 侧放行要求目的
+    地址与端口同时命中，端口并集本身不构成任何放行。
+    """
+    ports: set[int] = set()
+    for target in engagement.targets:
+        ports.update(target.ports)
+    return sorted(ports)
+
+
+def _feed_ports(args: argparse.Namespace, ports: List[int]) -> int:
+    """把授权端口并集喂入（或打印）allow_ports，返回 nft 执行失败的条目数。
+
+    一条命令带全部端口（同为 scope 派生的静态授权，无需逐条重试）；端口条目
+    与地址条目同用 --ttl 过期，scope 停止续期后端口放行随之失效（fail closed）。
+    """
+    if not ports:
+        logger.info("scope 中没有任何 ports 声明，allow_ports 保持为空（端口全拒）")
+        return 0
+    elements = ", ".join(f"{port} timeout {args.ttl}s" for port in ports)
+    cmd = ["nft", "add", "element", "inet", args.table, DEFAULT_SET_PORTS,
+           f"{{ {elements} }}"]
+    if args.dry_run:
+        print("# allow_ports：scope 全部目标 ports 并集（授权端口）")
+        print(" ".join(shlex.quote(part) for part in cmd))
+        return 0
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        logger.error("allow_ports：nft 添加失败（rc=%d）: %s", result.returncode, detail)
+        return 1
+    logger.info("allow_ports：已添加 %d 个授权端口（timeout %ds）", len(ports), args.ttl)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # 喂入 nftables
 # ---------------------------------------------------------------------------
@@ -377,7 +424,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "\n"
             "fail-closed：scope 无效或授权窗口外直接退出；域名解析失败仅警告并跳过，\n"
             "解析不出的域名不会产生任何放行条目。条目带 --ttl 自动过期，需周期重跑。\n"
-            "仅处理 kind: domain 目标；ip/cidr 目标属于静态集合 allow_ranges，人工维护。\n"
+            "地址只处理 kind: domain 目标（ip/cidr 属静态集合 allow_ranges，人工维护）；\n"
+            "--feed-ports 的端口并集来自全部目标的 ports，不带该参数时不喂端口。\n"
             "退出码：0 成功；1 有条目 nft 执行失败；2 fail-closed（scope 无效/窗口外）。\n"
         ),
     )
@@ -393,6 +441,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="集合条目存活秒数（默认 %(default)s）")
     parser.add_argument("--resolver", default=DEFAULT_RESOLVER, metavar="IP",
                         help="受控解析器地址（默认 %(default)s）")
+    parser.add_argument("--feed-ports", action="store_true",
+                        help="把 scope 中所有目标的 ports 并集喂进 allow_ports 集合"
+                             "（默认不喂端口，保持既有行为）")
     parser.add_argument("--dry-run", action="store_true",
                         help="只打印将执行的 nft 命令（stdout），不执行、不改集合")
     return parser
@@ -427,7 +478,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("找不到 nft 可执行文件；实际喂入需在扫描节点以 root 运行（预览请加 --dry-run）")
         return 2
 
-    failed = _feed(engagement, args)
+    failed = 0
+    if args.feed_ports:
+        # 端口喂入不依赖 DNS，放在地址喂入之前：dry-run 输出里第一段是确定性内容
+        failed += _feed_ports(args, _collect_ports(engagement))
+    failed += _feed(engagement, args)
     if failed:
         logger.error("有 %d 个条目 nft 执行失败，请检查表/集合是否存在", failed)
         return 1

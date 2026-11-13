@@ -3,6 +3,10 @@
 两个渲染器都只消费 Finding：先过 classify 定档，confirmed 正文在前、
 observed 在后、rejected 只进附录且不进 SARIF——渲染器不自己定结论，
 一律以 classify 的结果为准。
+
+输出前统一过 masking.mask_text（TASK-006 任务 3）：evidence 的 summary 与
+artifact 内联文本、SARIF 的 title/target——证据片段里的凭证形态渲染进报告
+就是二次泄露。
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .classify import Classification, classify
+from .masking import mask_text
 from .models import Evidence, Finding, FindingStatus, Severity
 
 _TOOL_NAME = "secops-report"
@@ -43,8 +48,13 @@ def _meta(meta: Mapping[str, Any], key: str, default: str = "未提供") -> str:
 
 
 def _evidence_text(ev: Evidence) -> str:
+    """一条证据的展示文本：summary 与 artifact 过 mask_text 后拼接。
+
+    artifact 是落盘文件路径时不含凭据形态，过掩码是恒等变换；"inline:..."
+    内联文本可能带响应头/token，必须脱敏（TASK-006 任务 3）。
+    """
     artifact = ev.artifact or "无佐证材料"
-    return f"[{ev.kind.value}] {ev.summary}（佐证：{artifact}）"
+    return f"[{ev.kind.value}] {mask_text(ev.summary)}（佐证：{mask_text(artifact)}）"
 
 
 def _summary_table(classified: list[tuple[Finding, Classification]]) -> list[str]:
@@ -177,6 +187,8 @@ def render_sarif(findings: list[Finding]) -> str:
     rejected 的 finding 不进 results。黑盒发现的“位置”是主机/URL 而非
     源码行号，所以 target 写进 artifactLocation.uri，region 只给最小占位
     （startLine=1 + snippet 重复 target，满足 spec 对 region 的形状要求）。
+    SARIF 不携带 evidence 文本，其自由文本只有 title/target 两处，输出前
+    同样过 mask_text（TASK-006 任务 3）。
     """
     results = []
     for f in findings:
@@ -186,11 +198,12 @@ def render_sarif(findings: list[Finding]) -> str:
         results.append({
             "ruleId": f.id,
             "level": _SARIF_LEVEL[f.severity],
-            "message": {"text": f.title},
+            "message": {"text": mask_text(f.title)},
             "locations": [{
                 "physicalLocation": {
-                    "artifactLocation": {"uri": f.target},
-                    "region": {"startLine": 1, "snippet": {"text": f.target}},
+                    "artifactLocation": {"uri": mask_text(f.target)},
+                    "region": {"startLine": 1,
+                               "snippet": {"text": mask_text(f.target)}},
                 },
             }],
         })
