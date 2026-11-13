@@ -1,0 +1,53 @@
+# 扫描节点镜像（TASK-008）：debian + nmap + curl + python3 + nuclei（按部署环境放入）。
+#
+# 构建（扫描节点或可出网的构建机，仓库根执行；--network host 走宿主机网络）：
+#   docker build --network host -f Dockerfile.scanner -t secops-scanner .
+#
+# 运行（任务协议时序见 deploy/protocol/README.md）：
+#   docker run --rm --network scannet \
+#     -v /jobs/SCAN-001/task.json:/tmp/task.json:ro \
+#     -v /jobs/SCAN-001/out:/tmp/out \
+#     secops-scanner \
+#     python3 /opt/protocol/run_scan.py --task /tmp/task.json --out /tmp/out/result.json
+#
+# 红线（方案 §5.1 / docker-compose.scan.yml 头注）：镜像与容器不得携带任何
+# 模型凭据（~/.hermes、API key、账号池配置等）——扫描节点被打穿也拿不到账号池。
+
+FROM debian:bookworm-slim
+
+# nuclei 版本（Go 单二进制）。部署时从官方 release 页取对应版本号并改这里：
+#   https://github.com/projectdiscovery/nuclei/releases
+ARG NUCLEI_VERSION=3.3.9
+
+# python3 仅用于 run_scan.py（任务协议执行器，纯标准库，不装任何 pip 包）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        nmap ca-certificates curl python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# nuclei 获取：release 的下载 URL/包名会随版本演进，故不在镜像里写死下载逻辑，
+# 部署时按构建机环境二选一（取消对应注释），产物统一放 /usr/local/bin/nuclei：
+#
+# 方式 A —— 构建机能直连 GitHub（或经 --network host 走宿主机代理）：
+#   1) 在上方 apt 安装清单追加 unzip
+#   2) 取消下面的注释（URL 模板，版本来自上面的 ARG NUCLEI_VERSION）：
+#   RUN curl -fL \
+#         "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" \
+#         -o /tmp/nuclei.zip \
+#       && unzip -o /tmp/nuclei.zip -d /tmp/nuclei-dist \
+#       && mv /tmp/nuclei-dist/nuclei /usr/local/bin/nuclei \
+#       && rm -rf /tmp/nuclei.zip /tmp/nuclei-dist \
+#       && nuclei -version
+#   建议下载后对照 release 页的 nuclei_${NUCLEI_VERSION}_checksums.txt 校验 SHA256。
+#
+# 方式 B —— 构建机不能出网：提前把二进制放进 build context（如仓库根 vendor/
+#   目录，vendor/ 不入库），取自同一 release 页的
+#   nuclei_${NUCLEI_VERSION}_linux_amd64.zip 解包产物，校验 checksum 后拷入：
+#   COPY vendor/nuclei /usr/local/bin/nuclei
+#   RUN chmod 0755 /usr/local/bin/nuclei && nuclei -version
+
+# 任务协议执行器与其 schema（纯标准库；构建 context 须为仓库根）
+COPY deploy/protocol/run_scan.py deploy/protocol/task-schema.json /opt/protocol/
+
+# 不设 ENTRYPOINT：镜像既是协议执行器（python3 /opt/protocol/run_scan.py ...），
+# 也保持手工首扫用法（docker run --network scannet secops-scanner nmap -sV -p3000 10.10.0.100）。

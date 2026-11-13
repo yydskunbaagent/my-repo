@@ -32,8 +32,18 @@ fail-closed 语义：
 喂入只处理 kind: domain 目标（二元组）；ip/cidr 目标属于静态集合 allow_ranges，
 按授权流程人工维护，脚本不碰（--feed-ports 收集的端口并集则来自全部目标，含
 ip/cidr——netrange 目标没有域名语义，靠 ranges×ports 组合放行）。
-include_subdomains 的子域不在喂入范围：子域解析结果不会
-进集合，nft 层自然拒绝（DNS 层由 unbound 的 transparent 子树放行，网络层兜底）。
+
+子域喂入（TASK-009）：不带 --feed-subdomains 时，include_subdomains 的子域不在
+喂入范围——子域解析结果不进集合，nft 层自然拒绝（DNS 层由 unbound 的 transparent
+子树放行，网络层兜底）。带 --feed-subdomains 时对每个 include_subdomains: true 的
+kind: domain 目标做子域枚举发现（DEFAULT_SUBDOMAIN_PREFIXES 常见前缀清单，可用
+--subdomain-prefixes 覆盖），解析出地址且通过归属校验的子域按父域授权端口
+（缺省 80,443）喂入 allow_pairs4/6。归属校验是保守启发式（严格归属校验需
+crt.sh/CT 日志或被动 DNS）：私网/保留段一律拒绝（is_blocked_network，与门禁引擎
+口径一致）；非私网地址还须与父域当前解析出的公网 IP 有网段亲和（IPv4 比较前两段
+octet /16、IPv6 比较前 64 位前缀 /64），不匹配的打 WARNING 并跳过——
+--loose-affinity 放宽为只做私网校验、不做亲和匹配。父域解析不出公网锚点时严格
+模式整体跳过该目标的子域发现（fail closed）。
 
 DNS 查询只用标准库 socket：直接向受控解析器发 UDP 报文（RFC1035 编解码在本文件
 内实现），不依赖 dnspython。--dry-run 时若受控解析器不可达，回退用系统解析器
@@ -44,6 +54,7 @@ DNS 查询只用标准库 socket：直接向受控解析器发 UDP 报文（RFC1
     python3 scope_feed.py --scope /etc/hermes/scope.yaml --feed-pairs               # 实际喂入（root + nft）
     python3 scope_feed.py --scope engagement-demo/scope.yaml --feed-pairs --dry-run # 只打印将执行的命令
     python3 scope_feed.py --scope /etc/hermes/scope.yaml --feed-pairs --feed-ports  # 二元组 + 授权端口一起喂
+    python3 scope_feed.py --scope /etc/hermes/scope.yaml --feed-subdomains          # 子域发现+归属校验+喂入
 
 退出码：0 成功（解析失败跳过属设计内行为，只警告）；1 有条目 nft 执行失败；
 2 fail-closed（scope 无效 / 授权窗口外 / 参数非法 / nft 缺失）。
@@ -63,7 +74,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import Callable, List, Sequence, Tuple
 
 # 复用 plugins/scope_gate：仓库根加进 sys.path（deploy/dns/ 向上两级即仓库根）。
 # scope 校验走 ScopeStore（内部即 plugins/scope_gate/scope.parse_scope 的校验路径），
@@ -84,6 +95,14 @@ DEFAULT_SET_PAIRS6 = "allow_pairs6"
 DEFAULT_SET_PORTS = "allow_ports"
 DEFAULT_TTL_SECONDS = 300
 DEFAULT_RESOLVER = "10.10.0.53"
+
+# 子域枚举前缀清单（TASK-009）：常见主机名前缀的保守集合，可按需扩展，
+# 或用 --subdomain-prefixes 整体覆盖。逐个向解析器查询 <prefix>.<域名>。
+DEFAULT_SUBDOMAIN_PREFIXES: Tuple[str, ...] = (
+    "www", "api", "app", "admin", "cdn", "static", "assets", "mail", "vpn",
+    "dev", "test", "staging", "m", "mobile", "portal", "git", "jenkins",
+    "docs", "status",
+)
 
 DNS_PORT = 53
 QUERY_TIMEOUT_SECONDS = 3.0  # 单次 UDP 查询超时；解析器不可达时尽快失败
@@ -261,6 +280,15 @@ def _dedupe(addrs: list) -> list:
     return list(dict.fromkeys(addrs))
 
 
+def _system_resolve(name: str, _resolver: str) -> Tuple[list, list]:
+    """统一解析接口 (name, resolver) 的系统解析器适配（dry-run 预览回退专用）。
+
+    受控解析器不可达且 --dry-run 时，子域管道与 --feed-pairs 一样回退系统
+    解析器仅作预览；系统解析器不使用 resolver 参数，由本适配抹平签名差异。
+    """
+    return _resolve_via_system(name)
+
+
 def _collect_ports(engagement: Engagement) -> List[int]:
     """收集 scope 中所有目标 ports 字段的并集（去重升序）。
 
@@ -357,10 +385,12 @@ def _feed_target_pairs(args: argparse.Namespace, name: str, source: str,
     return failed
 
 
-def _feed(engagement: Engagement, args: argparse.Namespace) -> int:
+def _feed(engagement: Engagement, args: argparse.Namespace,
+          seen: set[Tuple[str, str, int]] | None = None) -> int:
     """对每个 kind: domain 目标解析并把"IP . 授权端口"二元组喂入/打印。
 
-    返回 nft 执行失败的条目数。
+    返回 nft 执行失败的条目数。seen 可由调用方传入与 --feed-subdomains 共享
+    （同 IP:端口 只喂一次）；不传则自建，行为不变。
     """
     domains = engagement.domain_targets
     if not domains:
@@ -369,7 +399,8 @@ def _feed(engagement: Engagement, args: argparse.Namespace) -> int:
 
     resolver_down = False
     failed = 0
-    seen: set[Tuple[str, str, int]] = set()
+    if seen is None:
+        seen = set()
 
     for target in domains:
         name = target.normalized
@@ -413,6 +444,169 @@ def _feed(engagement: Engagement, args: argparse.Namespace) -> int:
         logger.info("%s：[%s] 解析到 %d 个 IPv4 / %d 个 IPv6，授权端口 %s",
                     name, source, len(v4), len(v6), ports)
         failed += _feed_target_pairs(args, name, source, v4, v6, ports, seen)
+
+    return failed
+
+
+# ---------------------------------------------------------------------------
+# 子域发现 → 归属校验 → 喂入（TASK-009）
+# ---------------------------------------------------------------------------
+
+def _affinity_match(addr, anchors: Sequence) -> bool:
+    """归属亲和判定（保守启发式）：addr 与任一锚点同源网段即视为同属。
+
+    规则（TASK-009 降级口径）：IPv4 比较前两段 octet（前 16 位）；IPv6 比较
+    前 64 位前缀。IPv4-mapped IPv6 先还原成 IPv4 再比（与 is_blocked_network
+    的还原口径一致，防映射写法绕过）。严格归属校验需 crt.sh/CT 日志或被动
+    DNS，当前是保守启发式：误放行风险由 nft 二元组的窄放行面（精确 IP . 端口
+    + timeout 自动过期）兜底，不匹配的地址一律 WARNING 并跳过供人工复核。
+    """
+    if isinstance(addr, ipaddress.IPv6Address):
+        mapped = addr.ipv4_mapped
+        if mapped is not None:
+            addr = mapped
+    for anchor in anchors:
+        if isinstance(anchor, ipaddress.IPv6Address):
+            anchor_mapped = anchor.ipv4_mapped
+            if anchor_mapped is not None:
+                anchor = anchor_mapped
+        if addr.version != anchor.version:
+            continue
+        if addr.version == 4:
+            if int(addr) >> 16 == int(anchor) >> 16:
+                return True
+        elif int(addr) >> 64 == int(anchor) >> 64:
+            return True
+    return False
+
+
+def _feed_subdomains(engagement: Engagement, args: argparse.Namespace,
+                     prefixes: Sequence[str],
+                     resolve: Callable[[str, str], Tuple[list, list]] | None = None,
+                     seen: set[Tuple[str, str, int]] | None = None) -> int:
+    """对每个 include_subdomains: true 的域名目标：子域发现→归属校验→喂入。
+
+    返回 nft 执行失败的条目数。流程：
+      1. 发现：按 prefixes 逐个查询 <prefix>.<域名>（NXDOMAIN 是枚举常态，
+         静默跳过；解析器中途失联则中止剩余前缀，已发现的照常走完校验）；
+      2. 归属校验：私网/保留段一律拒绝（is_blocked_network，与门禁引擎口径
+         一致）；严格模式还要求非私网地址与父域当前解析出的公网 IP 有网段
+         亲和（_affinity_match），不匹配打 WARNING 跳过——严格归属校验需
+         crt.sh/CT 日志或被动 DNS，当前是保守启发式。父域解析失败或全落
+         私网时无锚点，整体跳过该目标的子域发现（fail closed）；
+      3. 喂入：通过校验的地址按父域授权端口（缺省 80,443，打日志说明假设）
+         复用 _feed_target_pairs 喂入 allow_pairs4/6；seen 与 --feed-pairs
+         共享去重。
+
+    resolve 可注入（测试用假解析表，不真实联网），缺省 _resolve_domain；
+    --loose-affinity 不解析父域、不做亲和匹配，只做私网校验；--dry-run 下
+    受控解析器不可达时回退系统解析器仅作预览（正式运行不回退，与 --feed-pairs
+    一致）。
+    """
+    if resolve is None:
+        resolve = _resolve_domain
+    if seen is None:
+        seen = set()
+
+    subjects = [t for t in engagement.domain_targets if t.include_subdomains]
+    if not subjects:
+        logger.info("scope 中没有 include_subdomains: true 的域名目标，跳过子域发现")
+        return 0
+
+    failed = 0
+    for target in subjects:
+        parent = target.normalized
+        ports, defaulted = _target_ports(target)
+        if defaulted:
+            logger.warning("%s：目标未声明 ports，子域按 80,443 喂入二元组（缺省假设，"
+                           "建议在 scope 中显式声明端口以收紧放行面）", parent)
+
+        source = "子域发现（受控解析器）"
+        resolve_fn = resolve
+        anchors: list = []
+        if not args.loose_affinity:
+            # 严格模式先解析父域建立归属锚点（公网地址；私网/保留地址不能作锚点）
+            try:
+                pv4, pv6 = resolve_fn(parent, args.resolver)
+            except ResolverUnreachable as e:
+                if not args.dry_run:
+                    logger.warning("%s：无法连接受控解析器 %s（%s），跳过子域发现"
+                                   "——正式运行不回退", parent, args.resolver, e)
+                    continue
+                logger.warning("%s：受控解析器 %s 不可达（%s）；--dry-run 仅作预览，"
+                               "回退用系统解析器；正式运行不做回退，只会警告并跳过",
+                               parent, args.resolver, e)
+                resolve_fn = _system_resolve
+                source = "子域发现（系统解析器 dry-run 预览）"
+                try:
+                    pv4, pv6 = resolve_fn(parent, args.resolver)
+                except ResolutionFailed as e2:
+                    logger.warning("%s：父域解析失败（%s），无归属锚点，跳过子域发现",
+                                   parent, e2)
+                    continue
+            except ResolutionFailed as e:
+                logger.warning("%s：父域解析失败（%s），无归属锚点，跳过子域发现",
+                               parent, e)
+                continue
+            anchors = [a for a in (*pv4, *pv6) if not is_blocked_network(a)]
+            if not anchors:
+                logger.warning("%s：父域解析地址全部为私网/保留段，无可用公网归属锚点，"
+                               "跳过子域发现（fail closed）", parent)
+                continue
+            logger.info("%s：归属锚点（父域公网解析）：%s（亲和规则：IPv4 前 16 位 / "
+                        "IPv6 前 64 位）", parent, ", ".join(str(a) for a in anchors))
+
+        discovered: List[str] = []
+        passed: List[str] = []
+        skipped: List[str] = []
+        for prefix in prefixes:
+            sub = f"{prefix}.{parent}"
+            try:
+                v4, v6 = resolve_fn(sub, args.resolver)
+            except ResolutionFailed:
+                continue  # 子域不存在/解析失败：枚举探测的常态，静默跳过
+            except ResolverUnreachable as e:
+                logger.warning("%s：子域查询解析器失败（%s），中止剩余前缀的发现",
+                               parent, e)
+                break
+            except ValueError as e:
+                # 入口已把前缀校验为单标签，这里兜底非预期的域名构造失败
+                logger.warning("%s：子域名构造非法（%s），跳过", sub, e)
+                continue
+            if not v4 and not v6:
+                continue
+            discovered.append(sub)
+            if len(v4) + len(v6) > MAX_IPS_PER_DOMAIN:
+                logger.warning("%s：解析出 %d 个地址，超过单域名上限 %d，疑似泛解析，整体跳过",
+                               sub, len(v4) + len(v6), MAX_IPS_PER_DOMAIN)
+                skipped.append(sub)
+                continue
+            ok4: list = []
+            ok6: list = []
+            for addr in (*v4, *v6):
+                if is_blocked_network(addr):
+                    logger.warning("%s：解析到私网/保留地址 %s，跳过（与门禁引擎口径一致）",
+                                   sub, addr)
+                    continue
+                if not args.loose_affinity and not _affinity_match(addr, anchors):
+                    logger.warning("%s：%s 与父域 %s 解析地址无归属亲和，跳过"
+                                   "（严格归属校验需 crt.sh/CT 日志或被动 DNS，"
+                                   "当前是保守启发式）", sub, addr, parent)
+                    continue
+                (ok4 if addr.version == 4 else ok6).append(addr)
+            if ok4 or ok6:
+                passed.append(sub)
+                failed += _feed_target_pairs(args, sub, source, ok4, ok6, ports, seen)
+            else:
+                skipped.append(sub)
+
+        detail = (f"发现 {len(discovered)} 个"
+                  + (f"（{', '.join(discovered)}）" if discovered else "")
+                  + f"，通过校验 {len(passed)} 个，归属校验跳过 {len(skipped)} 个"
+                  + (f"（{', '.join(skipped)}）" if skipped else ""))
+        logger.info("%s：子域发现摘要——%s", parent, detail)
+        if args.dry_run:
+            print(f"# 子域发现摘要 [{parent}]：{detail}")
 
     return failed
 
@@ -462,13 +656,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "示例：\n"
             "  scope_feed.py --scope /etc/hermes/scope.yaml --feed-pairs\n"
             "  scope_feed.py --scope engagement-demo/scope.yaml --feed-pairs --dry-run\n"
+            "  scope_feed.py --scope /etc/hermes/scope.yaml --feed-subdomains --dry-run\n"
             "\n"
             "fail-closed：scope 无效或授权窗口外直接退出；域名解析失败仅警告并跳过，\n"
             "解析不出的域名不会产生任何放行条目。条目带 --ttl 自动过期，需周期重跑。\n"
             "--feed-pairs 的二元组只处理 kind: domain 目标（ip/cidr 属静态集合\n"
             "allow_ranges，人工维护）；--feed-ports 的端口并集来自全部目标的 ports\n"
-            "（服务 netrange 目标的 ranges×ports 路径）。不带任何 feed 参数时\n"
-            "不喂任何集合，仅校验 scope 与授权窗口。\n"
+            "（服务 netrange 目标的 ranges×ports 路径）。--feed-subdomains 只处理\n"
+            "include_subdomains: true 的域名目标，归属校验为保守启发式（默认还要求\n"
+            "与父域解析 IP 网段亲和，--loose-affinity 放宽为仅拒私网/保留段）。\n"
+            "不带任何 feed 参数时不喂任何集合，仅校验 scope 与授权窗口。\n"
             "退出码：0 成功；1 有条目 nft 执行失败；2 fail-closed（scope 无效/窗口外）。\n"
         ),
     )
@@ -490,6 +687,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feed-ports", action="store_true",
                         help="把 scope 中所有目标的 ports 并集喂进 allow_ports 集合"
                              "（服务 netrange 目标的 ranges×ports 路径）")
+    parser.add_argument("--feed-subdomains", action="store_true",
+                        help="对 include_subdomains: true 的域名目标做子域枚举发现，"
+                             "通过归属校验的子域解析 IP 按父域授权端口喂进 "
+                             "allow_pairs4/6（TASK-009；保守启发式校验，缺省前缀清单 "
+                             f"{','.join(DEFAULT_SUBDOMAIN_PREFIXES)}）")
+    parser.add_argument("--subdomain-prefixes", default=None, metavar="A,B,…",
+                        help="逗号分隔的子域前缀清单，覆盖默认清单"
+                             "（须为单个 ASCII 标签：不含点、长度≤63）")
+    parser.add_argument("--loose-affinity", action="store_true",
+                        help="放宽子域归属校验：不做父域网段亲和匹配，仅拒私网/保留段"
+                             "（默认关闭）")
     parser.add_argument("--dry-run", action="store_true",
                         help="只打印将执行的 nft 命令（stdout），不执行、不改集合")
     return parser
@@ -509,6 +717,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("--resolver 不是合法 IP: %r（%s）", args.resolver, e)
         return 2
 
+    # 子域前缀清单：必须先于任何 DNS 查询校验完毕（非法清单 -> rc=2，fail closed）
+    prefixes = DEFAULT_SUBDOMAIN_PREFIXES
+    if args.subdomain_prefixes is not None:
+        raw = tuple(dict.fromkeys(
+            p.strip().lower() for p in args.subdomain_prefixes.split(",") if p.strip()))
+        if not raw:
+            logger.error("--subdomain-prefixes 没有给出任何前缀")
+            return 2
+        bad = [p for p in raw if "." in p or len(p) > 63 or not p.isascii()]
+        if bad:
+            logger.error("--subdomain-prefixes 含非法前缀（须为单个 ASCII 标签："
+                         "不含点、长度≤63）: %s", ", ".join(bad))
+            return 2
+        prefixes = raw
+
     engagement = _load_engagement(args.scope)
     if engagement is None:
         return 2
@@ -520,20 +743,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 engagement.window.start.isoformat(), engagement.window.end.isoformat(),
                 len(engagement.domain_targets))
 
-    if (args.feed_pairs or args.feed_ports) and not args.dry_run \
+    if (args.feed_pairs or args.feed_ports or args.feed_subdomains) and not args.dry_run \
             and shutil.which("nft") is None:
         logger.error("找不到 nft 可执行文件；实际喂入需在扫描节点以 root 运行（预览请加 --dry-run）")
         return 2
-    if not args.feed_pairs and not args.feed_ports:
-        logger.warning("未指定 --feed-pairs / --feed-ports：本次不喂任何集合"
+    if not args.feed_pairs and not args.feed_ports and not args.feed_subdomains:
+        logger.warning("未指定 --feed-pairs / --feed-ports / --feed-subdomains：本次不喂任何集合"
                        "（仅校验 scope 与授权窗口；喂集动作必须显式选择）")
 
+    seen: set[Tuple[str, str, int]] = set()
     failed = 0
     if args.feed_ports:
         # 端口喂入不依赖 DNS，放在二元组喂入之前：dry-run 输出里第一段是确定性内容
         failed += _feed_ports(args, _collect_ports(engagement))
     if args.feed_pairs:
-        failed += _feed(engagement, args)
+        failed += _feed(engagement, args, seen=seen)
+    if args.feed_subdomains:
+        failed += _feed_subdomains(engagement, args, prefixes, seen=seen)
     if failed:
         logger.error("有 %d 个条目 nft 执行失败，请检查表/集合是否存在", failed)
         return 1

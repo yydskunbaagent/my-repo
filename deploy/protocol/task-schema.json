@@ -1,0 +1,162 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:hermes:scan-protocol:task-schema",
+  "title": "扫描任务协议 task.json schema（TASK-008）",
+  "description": "推理端产出、下发到扫描节点的任务文件（run_scan.py 的唯一输入）。校验规则与 run_scan.py 的手写校验一一对应、双重生效（fail closed）：工具白名单 nmap/nuclei/curl_probe，白名单外一律拒绝；args/paths 禁止分号、反引号与 $( 命令替换（pattern 校验 + 脚本双重校验）；nuclei 动作必须带 -json（findings 自动提取依赖逐行 JSONL 输出）；expires_at 早于当前时间则 run_scan.py 拒绝执行。targets[].kind 目前只支持 http/https（curl_probe 的 URL scheme 来源），扩展 kind/工具白名单须先同步改本 schema 与 run_scan.py，再重建镜像。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "engagement_id", "targets", "actions", "rate_limit", "created_at", "expires_at"],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "description": "任务编号，如 SCAN-001；用于日志、result.json 与 raw/ 文件的对照。"
+    },
+    "engagement_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "description": "授权项目编号，须与扫描节点已加载的 scope.yaml（engagement.id）对应。"
+    },
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "description": "本次任务的目标清单，须是授权 scope 目标的子集；越界由扫描节点网络层（scan-node.nft + 受控解析器）兜底，本协议层校验只是第一道。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["host", "ports", "kind"],
+        "properties": {
+          "host": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            "description": "主机名 / IPv4 / IPv6（IPv6 带冒号）；不允许 scheme、路径或空白。"
+          },
+          "ports": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            }
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["http", "https"],
+            "description": "服务类型；curl_probe 按 kind 决定 URL scheme。暂不支持其他类型（nmap-only 任务扩展 kind 须先改本 schema 与 run_scan.py）。"
+          }
+        }
+      }
+    },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "description": "按序执行的动作清单，每条恰好一个工具；白名单之外一律拒绝。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tool"],
+        "properties": {
+          "tool": {
+            "type": "string",
+            "enum": ["nmap", "nuclei", "curl_probe"]
+          },
+          "args": {
+            "type": "array",
+            "minItems": 1,
+            "description": "传给 nmap/nuclei 的参数（逐元素 argv，subprocess 不经 shell 拼接）。",
+            "items": {
+              "type": "string",
+              "allOf": [
+                {
+                  "pattern": "^[^;`]*$",
+                  "title": "禁止分号与反引号"
+                },
+                {
+                  "not": {
+                    "pattern": "\\$\\(",
+                    "title": "禁止 $( 命令替换"
+                  }
+                }
+              ]
+            }
+          },
+          "paths": {
+            "type": "array",
+            "minItems": 1,
+            "description": "curl_probe 逐个 GET 的路径（以 / 开头），拼在 http(s)://host:port 之后。",
+            "items": {
+              "type": "string",
+              "pattern": "^/",
+              "allOf": [
+                {
+                  "pattern": "^[^;`]*$",
+                  "title": "禁止分号与反引号"
+                },
+                {
+                  "not": {
+                    "pattern": "\\$\\(",
+                    "title": "禁止 $( 命令替换"
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {"tool": {"const": "curl_probe"}},
+              "required": ["tool"]
+            },
+            "then": {
+              "required": ["paths"],
+              "not": {"required": ["args"]}
+            },
+            "else": {
+              "required": ["args"],
+              "not": {"required": ["paths"]}
+            }
+          },
+          {
+            "if": {
+              "properties": {"tool": {"const": "nuclei"}},
+              "required": ["tool"]
+            },
+            "then": {
+              "properties": {
+                "args": {"contains": {"const": "-json"}}
+              }
+            }
+          }
+        ]
+      }
+    },
+    "rate_limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rps_per_host", "max_requests_per_host"],
+      "description": "每主机限速声明：推理端须把它折进工具参数（如 nmap --max-rate）；run_scan.py 校验存在与取值，不代为执行限速，网络层另有 nftables 门禁兜底。",
+      "properties": {
+        "rps_per_host": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_requests_per_host": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "任务生成时间（ISO8601，建议带时区；不带时区按 UTC 处理）。"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "任务过期时间；run_scan.py 在扫描节点上强制校验，过期拒绝执行（过期任务文件重放无效）。"
+    }
+  }
+}

@@ -6,7 +6,8 @@
     2. 动作是否被禁止               -> forbidden 优先于 allowed
     3. 是否在时间窗内
     4. 动作是否在允许集内
-    5. 目标是否为空                 -> 空=解析失败=拒（委派类工具除外：空=交子层把关）
+    5. 目标是否为空                 -> 空=解析失败=拒（委派类空=交子层把关；
+                                       本地类不出网，放行——TASK-010）
     6. 逐个目标：云元数据 / 排除项 / 范围 / 端口 / 解析结果（私网/保留段默认阻断）
     7. 速率与总量
     8. 高危动作升级人工确认
@@ -19,7 +20,7 @@ from datetime import datetime, timezone
 from ipaddress import IPv4Address, IPv6Address
 from typing import Iterable, List, Optional, Tuple
 
-from .extract import is_delegate_tool
+from .extract import is_delegate_tool, is_local_tool
 from .models import (
     Action,
     Decision,
@@ -207,6 +208,9 @@ def decide(
         # （TASK-005 缺陷 1：从"不认识就拒"改为"提得出就按目标判，提不出才交子层"）
         if is_delegate_tool(tool_name):
             return Decision(DecisionKind.ALLOW, "delegate_no_target", "")
+        # 本地类工具（TASK-010）：不出网，无目标不算解析失败，直接放行
+        if is_local_tool(tool_name):
+            return Decision(DecisionKind.ALLOW, "local_tool", "")
         return _block("no_target",
                       f"{head}\n被拒绝：未解析到任何目标。")
 

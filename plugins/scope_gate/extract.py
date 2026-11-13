@@ -2,6 +2,9 @@
 
 分类策略：**默认按出网处理**。只有明确列入本地只读清单的工具才放行，
 其余一概走 scope 校验。理由——新装一个插件工具就自动变成绕过通道，是最常见的失守方式。
+
+TASK-010 补充：明确列入 LOCAL_TOOLS 的本地类工具（不出网）跳过目标提取与
+no_target 判定（is_local_tool）；清单外的未知工具仍默认按出网处理，策略不变。
 """
 
 from __future__ import annotations
@@ -10,7 +13,7 @@ import os
 import re
 import shlex
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 from .models import Action
 from .target import Target, TargetError, extract_targets
@@ -73,6 +76,43 @@ DELEGATE_TOOL = "delegate_task"
 def is_delegate_tool(name: str) -> bool:
     """是否委派类工具（不区分大小写）。"""
     return (name or "").strip().lower() == DELEGATE_TOOL
+
+
+# 本地类工具（TASK-010）：不产生网络流量，跳过目标提取与 no_target 判定。
+# 与 LOCAL_READ_TOOLS / LOCAL_WRITE_TOOLS 有意重叠——那两个是 gate 里的更早
+# 快速通道，这里是统一兜底：清单外的本地工具（tool_describe / tool_search /
+# security_scan_* 等）此前被当未知出网工具误杀（2026-11-14 A6 复测：参数无 IP
+# 即 no_target，hermes-security 官方插件并发审计被拦 ~10 次）。
+LOCAL_TOOLS = frozenset({
+    "read_file", "write_file", "edit_file", "list_dir", "list_directory",
+    "search_files", "tool_describe", "tool_search", "tool_search_describe",
+    "memory_write", "memory_read", "todo_write", "session_status",
+    # hermes-security 插件的 9 个本地分析工具
+    "security_scan_start", "security_scan_get", "security_scan_checkpoint",
+    "security_scan_submit_worker_result", "security_scan_record_validations",
+    "security_scan_record_chains", "security_scan_finalize",
+    "security_scan_cancel", "security_scan_export",
+})
+# 部署方经 GateConfig.extra_local_tools 注入的名字（运行时合并进本地清单）。
+# gate 是进程级单例（见 gate.py），注册一次全局生效。
+_EXTRA_LOCAL_TOOLS: set[str] = set()
+
+
+def register_local_tools(names: Iterable[str] | None) -> None:
+    """把部署方声明的本地工具合并进本地清单（config.yaml 的 extra_local_tools）。
+
+    运行时合并而非改代码：部署方不改 scope_gate 源码即可声明自己的本地工具。
+    重复注册幂等，名字统一小写归一（与 is_local_tool 的匹配规则一致）。
+    """
+    for n in names or ():
+        if isinstance(n, str) and n.strip():
+            _EXTRA_LOCAL_TOOLS.add(n.strip().lower())
+
+
+def is_local_tool(name: str) -> bool:
+    """是否本地类工具（不区分大小写，含部署方注入的 extra 清单）。"""
+    n = (name or "").strip().lower()
+    return n in LOCAL_TOOLS or n in _EXTRA_LOCAL_TOOLS
 
 
 def _collect_strings(value: object, out: List[str]) -> None:
@@ -264,7 +304,11 @@ def analyze_tool(tool_name: str, args: dict) -> Analysis:
                         command=target_text,
                         parse_error="" if found else "浏览器动作未解析出目标")
 
-    # 未知工具：按"可能出网"处理，要求能从参数里解析出目标
+    # 未知工具：按"可能出网"处理，要求能从参数里解析出目标。已知出网工具
+    # （terminal/browser/delegate）的全文提取原样保留——版本号（python-3.14.9
+    # -> 3.14.0.9，见 target._parse_legacy_ipv4 的 inet_aton 语义）与标识符
+    # （os.path.join -> 域名）会被误解析成目标，在这类工具里是可接受的误报
+    # 代价：绕过检测优先于提取精度（TASK-010 取舍，仅本地工具豁免提取）。
     blob = ""
     if isinstance(args, dict):
         blob = " ".join(str(v) for v in args.values() if isinstance(v, str))

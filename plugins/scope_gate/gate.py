@@ -24,7 +24,14 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .audit import AuditLog
 from .engine import decide
-from .extract import LOCAL_READ_TOOLS, LOCAL_WRITE_TOOLS, analyze_tool, paths_from_args
+from .extract import (
+    LOCAL_READ_TOOLS,
+    LOCAL_WRITE_TOOLS,
+    analyze_tool,
+    is_local_tool,
+    paths_from_args,
+    register_local_tools,
+)
 from .models import Action, Decision, DecisionKind, TargetKind
 from .ratelimit import RateLimiter
 from .scope import ScopeStore
@@ -45,6 +52,9 @@ class GateConfig:
     dns_ttl: int = DNS_TTL_SECONDS
     dns_timeout: float = DNS_TIMEOUT_SECONDS
     allow_local_write: bool = True
+    # 部署方声明的本地工具（TASK-010）：运行时合并进 extract 的本地清单，
+    # 不改代码即可扩展（config.yaml 的 extra_local_tools: 列表）
+    extra_local_tools: Tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any], base_dir: Path) -> "GateConfig":
@@ -72,6 +82,10 @@ class GateConfig:
             dns_ttl=int(data.get("dns_ttl", DNS_TTL_SECONDS)),
             dns_timeout=float(data.get("dns_timeout", DNS_TIMEOUT_SECONDS)),
             allow_local_write=bool(data.get("allow_local_write", True)),
+            extra_local_tools=tuple(
+                str(item).strip() for item in (data.get("extra_local_tools") or [])
+                if str(item).strip()
+            ),
         )
 
 
@@ -136,6 +150,8 @@ class ScopeGate:
     def __init__(self, config: GateConfig, *, resolver: Optional[Resolver] = None,
                  clock=None):
         self.config = config
+        # 部署方声明的本地工具合并进本地清单（TASK-010）：不改代码即可扩展
+        register_local_tools(config.extra_local_tools)
         self.store = ScopeStore(config.scope_path)
         self.audit = AuditLog(config.audit_path)
         self.limiter = RateLimiter(config.rate_limit_db, clock=clock or time.monotonic)
@@ -181,8 +197,9 @@ class ScopeGate:
         if tool_name in LOCAL_READ_TOOLS:
             return Decision(DecisionKind.ALLOW, "local_read", "")
 
-        # 写本地文件：只做路径保护
-        if tool_name in LOCAL_WRITE_TOOLS:
+        # 写本地文件 / 本地类工具（TASK-010）：不要求网络目标，只做路径保护。
+        # 路径保护照常生效——本地工具改写作业元数据（scope.yaml / 审计目录）仍要拦。
+        if tool_name in LOCAL_WRITE_TOOLS or is_local_tool(tool_name):
             hit = self._protected(paths_from_args(tool_name, args))
             if hit:
                 return Decision(
@@ -190,7 +207,8 @@ class ScopeGate:
                     f"[scope-gate] 被拒绝：{hit} 属于作业元数据（scope / 授权书 / 审计），"
                     f"Agent 不得写入。请把产出写到 evidence/ 或 reports/ 下。",
                 )
-            return Decision(DecisionKind.ALLOW, "local_write", "")
+            code = "local_write" if tool_name in LOCAL_WRITE_TOOLS else "local_tool"
+            return Decision(DecisionKind.ALLOW, code, "")
 
         state = self.store.state
         if not state.usable:
