@@ -27,6 +27,9 @@
 
 flush ruleset
 
+# 运维 SSH 端口：加载前必须确认与本机实际 SSH 端口一致，否则自锁
+define SSH_PORT = 22
+
 table inet hermes_scan {
 
     # 动态集合：scope_feed.py 运行时喂入的域名解析结果。
@@ -70,6 +73,9 @@ table inet hermes_scan {
         type filter hook input priority filter; policy drop;
         iifname "lo" accept comment "本机回环"
         ct state established,related accept comment "已建立连接的回包"
+        # 运维 SSH 通道：端口经 define 调整（映射端口场景如云主机 53142 -> 22）。
+        # 警告：没有这条就加载本文件 = 自锁，只能靠云控制台/VNC 或重启抢救。
+        tcp dport $SSH_PORT accept comment "运维 SSH"
         # 其余入站一律 policy drop（reasoning -> egress-proxy 的 input 放行
         # 属部署决策点，见文件尾部，不在此默认放开）
     }
