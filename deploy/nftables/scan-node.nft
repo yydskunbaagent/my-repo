@@ -1,0 +1,97 @@
+#!/usr/sbin/nft -f
+# 扫描节点网络策略：default-deny（默认拒绝）。
+# 语义依据：方案 §5.1/§5.2（docs/tasks/TASK-002.md）。
+#
+# 放行条目的唯一来源是 scope 授权流程：
+#   - kind: domain   -> deploy/dns/scope_feed.py 把解析结果喂入 allow_domains4/6
+#                       （动态集合，条目带 timeout 自动过期，需按 TTL 周期重跑）
+#   - kind: ip/cidr  -> 人工写入 allow_ranges4/6（静态网段集合，须有授权记录）
+# 本文件之外不存在任何"配置坏了就放行"的口子。
+#
+# 加载：nft -f /etc/nftables/scan-node.nft（root）。建议在 docker 启动前加载
+# （如 nftables.service）：flush ruleset 会连同运行中 docker 注入的表一并清空，
+# 加载后容器网络需 docker 重建规则（重启 docker 或让其重建链）。
+
+flush ruleset
+
+table inet hermes_scan {
+
+    # 动态集合：scope_feed.py 运行时喂入的域名解析结果。
+    # 脚本只喂公网地址（私网/保留段被 plugins/scope_gate/engine.is_blocked_network 挡下）。
+    # flags timeout 必须保留：没有它，`add element ... timeout <n>s` 会被 nft 拒绝。
+    set allow_domains4 {
+        type ipv4_addr
+        flags timeout
+    }
+    set allow_domains6 {
+        type ipv6_addr
+        flags timeout
+    }
+
+    # 静态集合：netrange（IP/CIDR）授权，部署时按 scope.yaml 人工填入，例如：
+    #   nft add element inet hermes_scan allow_ranges4 { 203.0.113.0/24 }
+    # 刻意留空并预置 interval：默认拒绝意味着文件里不预置任何放行网段。
+    # 不用 auto-merge：加入与现有条目重叠的网段会被 nft 拒绝，
+    # 重叠说明授权有歧义，应当人工排查而不是静默合并。
+    set allow_ranges4 {
+        type ipv4_addr
+        flags interval
+    }
+    set allow_ranges6 {
+        type ipv6_addr
+        flags interval
+    }
+
+    # 入站：只放行 lo 与已建立连接。扫描节点不对外提供任何服务。
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iifname "lo" accept comment "本机回环"
+        ct state established,related accept comment "已建立连接的回包"
+        # 其余入站一律 policy drop
+    }
+
+    # 转发：scanner 容器（deploy/docker-compose.scan.yml）的全部出网经此链。
+    # 依赖 docker 默认开启的 br_netfilter（bridge-nf-call-iptables=1），
+    # 同网段容器间流量（scanner -> 受控解析器）同样经过本链。
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        ct state established,related accept comment "已建立连接的回包"
+
+        # 1) DNS 出站只允许到受控解析器 10.10.0.53；其余 DNS 全部丢弃——
+        #    防止绕过解析器直连公网 53 借 DNS 隧道外送（方案 §5.2 配套要求）。
+        #    解析器自身对 scope 外域名返回 REFUSED（见 deploy/dns/unbound.conf）。
+        ip daddr 10.10.0.53 udp dport 53 accept
+        ip daddr 10.10.0.53 tcp dport 53 accept
+        udp dport 53 drop
+        tcp dport 53 drop
+
+        # 2) 扫描流量：TCP 80/443 只允许到授权地址（域名动态集合 + 网段静态集合）。
+        ip  daddr @allow_domains4 tcp dport { 80, 443 } accept
+        ip  daddr @allow_ranges4  tcp dport { 80, 443 } accept
+        ip6 daddr @allow_domains6 tcp dport { 80, 443 } accept
+        ip6 daddr @allow_ranges6  tcp dport { 80, 443 } accept
+
+        # 3) 其余出站一律 policy drop：直连任意 IP 的探测、ICMP、UDP 等全不放过。
+    }
+}
+
+# ---- 部署决策点（默认不启用，评审后放开）--------------------------------
+# unbound 采用转发模式（deploy/dns/unbound.conf 的 forward-zone），其自身对
+# 上游 1.1.1.1/8.8.8.8 的 53 查询同样经过 forward 链，会被上面"其余 DNS 全部
+# 丢弃"的规则挡下——转发模式因此无法工作。可选方案（任选其一）：
+#
+#   a) 仅放行受控解析器自身向上游发起的 DNS（对 forward 链最小改动，置于两条
+#      drop 之前；效果：只有 10.10.0.53 这一台可信机器可对外发 DNS）：
+#         ip saddr 10.10.0.53 udp dport 53 accept
+#         ip saddr 10.10.0.53 tcp dport 53 accept
+#
+#   b) 解析器上游改 DoT（tcp 853）并为 10.10.0.53 放行 tcp 853，
+#      明文 53 保持全拒（上游链路上不暴露查询内容）。
+#
+#   c) 解析器部署在宿主机 10.10.0.53：容器的 DNS 查询将命中 input 链
+#      （目的为本机地址），需在 input 链为 10.10.0.53 增加 53 放行
+#      （同样评审后加），并自行收敛宿主机 output 面。
+#
+# 本文件刻意不设 output 基础链：默认拒绝覆盖容器转发面（forward）与入站面
+# （input）；宿主机自身出站（管理通道）另行评审收敛，不在此文件默认放开。
+# --------------------------------------------------------------------------

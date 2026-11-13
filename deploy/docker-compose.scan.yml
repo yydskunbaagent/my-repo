@@ -1,0 +1,49 @@
+# 扫描作业拓扑声明（方案 §5.1/§5.2；声明用，不直接 docker compose up）。
+#
+#   reasoning —— network_mode: none，完全无出网；模型凭据只存在于该节点
+#   scanner   —— scannet 内部网络（internal: true），出网由宿主机
+#                deploy/nftables/scan-node.nft 的 forward 链默认拒绝、按 scope 放行
+#   受控解析器（unbound）部署在 scannet 的 10.10.0.53（deploy/dns/unbound.conf），
+#   不在本文件中声明（部署方式按 scan-node.nft 尾部"部署决策点"选型）
+#
+# 红线：scanner 容器内不得挂载任何含模型凭据的路径（~/.hermes、API key、
+# 账号池配置等）——扫描节点不持有模型凭据，被打穿也拿不到账号池（方案 §5.1）。
+
+services:
+  reasoning:
+    # 占位镜像：按 P0-B 验收时替换为实际推理镜像（Hermes + hermes-security）
+    image: scratch
+    network_mode: none
+    # 模型凭据与作业配置只存在于推理节点，且只读挂载
+    volumes:
+      - ~/.hermes:/hermes:ro
+    # 本节点不安装 nmap/nuclei/httpx 等任何扫描工具；
+    # 推理节点只产出结构化任务（JSON 文件/RPC），与扫描节点不共享 shell。
+
+  scanner:
+    # 占位镜像：按 P0-B 验收时替换为下面注释所述方式构建的镜像。镜像内安装：
+    #   FROM debian:bookworm-slim
+    #   RUN apt-get update \
+    #     && apt-get install -y --no-install-recommends nmap ca-certificates curl \
+    #     && rm -rf /var/lib/apt/lists/*
+    #   # nuclei / httpx 为 Go 单二进制，取官方 release 放入 /usr/local/bin：
+    #   #   https://github.com/projectdiscovery/nuclei/releases -> nuclei_linux_amd64
+    #   #   https://github.com/projectdiscovery/httpx/releases  -> httpx_linux_amd64
+    image: scratch
+    networks:
+      - scannet
+    # 扫描器解析只走受控解析器（其余 53 出站被 scan-node.nft 丢弃）
+    dns: 10.10.0.53
+    # nmap -sS / masscan 需要原始套接字；无需 NET_ADMIN
+    cap_add:
+      - NET_RAW
+    # 红线：本容器不得挂载任何含模型凭据的路径（~/.hermes 等）；
+    # 任务与结果只走 JSON 文件/RPC，与推理节点不共享 shell。
+
+networks:
+  scannet:
+    internal: true
+    ipam:
+      config:
+        # 网段与 nftables/unbound 配置对齐：受控解析器固定 10.10.0.53
+        - subnet: 10.10.0.0/24
