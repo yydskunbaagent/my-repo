@@ -31,6 +31,11 @@ git clone --depth 1 https://<FINE-GRAINED-TOKEN>@github.com/yydskunbaagent/my-re
 
 ## 3. nftables 基线（B4 的关键）
 
+> ⚠️ **自锁警告（2026-11-14 实测事故）**：本文件 input 链 policy drop。加载前必须确认
+> `define SSH_PORT` 与实际 SSH 端口一致（云主机映射端口如 53142 要改），否则新 SSH 会话
+> 全部被丢 = 失联，只能靠云控制台/VNC 或重启抢救（规则为内存态，重启即清空）。
+> 建议先 `nft -c -f` 语法检查，加载后**保持当前会话不断开**再开新会话验证 SSH。
+
 ```bash
 nft -f /opt/secops/my-repo/deploy/nftables/scan-node.nft
 nft list ruleset | head -40   # 确认 hermes_scan 表已加载
