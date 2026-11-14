@@ -128,25 +128,33 @@ def _render_rejected(f: Finding) -> list[str]:
     return lines
 
 
-def render_markdown(findings: list[Finding], engagement_meta: Mapping[str, Any]) -> str:
-    """渲染整份 Markdown 报告。
+def render_engagement_meta(engagement_meta: Mapping[str, Any]) -> str:
+    """作业信息块（TASK-018 抽取为公共函数）：授权方与作业周期两行。
 
-    engagement_meta 约定的键（全部可缺省）：
-    - engagement_id: 作业编号，进报告标题
-    - authorized_by: 授权方
-    - period: 作业周期
-    - coverage_gaps: 未覆盖项列表，渲染成末尾 Coverage Gaps 章节
+    返回文本以空行结尾（"\n\n"），供合并报告（merge.py）与 render_markdown
+    拼接后续章节。
     """
-    classified = [(f, classify(f)) for f in findings]
-
-    lines = [f"# 黑盒渗透测试报告（{_meta(engagement_meta, 'engagement_id')}）", ""]
-    lines.extend([
+    lines = [
         "## 作业信息",
         "",
         f"- 授权方：{_meta(engagement_meta, 'authorized_by')}",
         f"- 作业周期：{_meta(engagement_meta, 'period')}",
         "",
-    ])
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def render_blackbox_body(findings: list[Finding],
+                         engagement_meta: Mapping[str, Any]) -> str:
+    """黑盒报告正文（TASK-018 抽取为公共函数）：标题与作业信息块之外的全部。
+
+    = 执行摘要 + Confirmed/Observed 分档正文 + Rejected 附录 + Coverage Gaps。
+    render_markdown 与 merge.py 的统一报告共用本函数，保证两条出口的分档
+    渲染永远一致。
+    """
+    classified = [(f, classify(f)) for f in findings]
+
+    lines = []
     lines.extend(_summary_table(classified))
     lines.append("")
 
@@ -181,14 +189,28 @@ def render_markdown(findings: list[Finding], engagement_meta: Mapping[str, Any])
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_sarif(findings: list[Finding]) -> str:
-    """渲染 SARIF 2.1.0 最小合法结构（runs[].tool.driver + runs[].results[]）。
+def render_markdown(findings: list[Finding], engagement_meta: Mapping[str, Any]) -> str:
+    """渲染整份 Markdown 报告。
 
-    rejected 的 finding 不进 results。黑盒发现的“位置”是主机/URL 而非
-    源码行号，所以 target 写进 artifactLocation.uri，region 只给最小占位
-    （startLine=1 + snippet 重复 target，满足 spec 对 region 的形状要求）。
-    SARIF 不携带 evidence 文本，其自由文本只有 title/target 两处，输出前
-    同样过 mask_text（TASK-006 任务 3）。
+    engagement_meta 约定的键（全部可缺省）：
+    - engagement_id: 作业编号，进报告标题
+    - authorized_by: 授权方
+    - period: 作业周期
+    - coverage_gaps: 未覆盖项列表，渲染成末尾 Coverage Gaps 章节
+    """
+    header = (
+        f"# 黑盒渗透测试报告（{_meta(engagement_meta, 'engagement_id')}）\n"
+        "\n"
+        + render_engagement_meta(engagement_meta)
+    )
+    return header + render_blackbox_body(findings, engagement_meta)
+
+
+def sarif_results(findings: list[Finding]) -> list[dict[str, Any]]:
+    """SARIF results 数组的构建（TASK-018 抽取为公共函数）。
+
+    rejected 的 finding 不进 results；level 按 _SARIF_LEVEL 映射；title/target
+    过 mask_text。render_sarif 与 merge.py 的合并 SARIF 共用本函数。
     """
     results = []
     for f in findings:
@@ -207,12 +229,23 @@ def render_sarif(findings: list[Finding]) -> str:
                 },
             }],
         })
+    return results
+
+
+def render_sarif(findings: list[Finding]) -> str:
+    """渲染 SARIF 2.1.0 最小合法结构（runs[].tool.driver + runs[].results[]）。
+
+    黑盒发现的“位置”是主机/URL 而非源码行号，所以 target 写进
+    artifactLocation.uri，region 只给最小占位（startLine=1 + snippet 重复
+    target，满足 spec 对 region 的形状要求）。SARIF 不携带 evidence 文本，
+    其自由文本只有 title/target 两处，输出前同样过 mask_text（TASK-006 任务 3）。
+    """
     doc = {
         "$schema": _SARIF_SCHEMA,
         "version": _SARIF_VERSION,
         "runs": [{
             "tool": {"driver": {"name": _TOOL_NAME}},
-            "results": results,
+            "results": sarif_results(findings),
         }],
     }
     return json.dumps(doc, ensure_ascii=False, indent=2) + "\n"

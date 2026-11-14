@@ -38,6 +38,7 @@ metadata:
 ## How to Run
 
 - 所有网络探测命令经 `terminal` 工具执行，形如 `terminal(command="curl -si http://<target>/robots.txt", timeout=...)`
+- 若处于推理/扫描分离拓扑（扫描节点）：主动探测动作不直连目标，打包成 `task.json` 经任务协议（`deploy/protocol/run_scan.py`，可用 `dispatch.py` 一键投递/回收）执行；回程结果已自动脱敏并带不可信数据域标记
 - 探测节流：请求间隔遵守 rps_per_host，不做并发轰炸；请求总量控制在 max_requests_per_host / max_total 内
 - 本地文件查看用 ls/cat/grep 类白名单命令；证据落盘用 `write_file`（见阶段 3）
 
@@ -81,7 +82,7 @@ curl -si http://<target>/
    - confirmed：PoC 正负对照齐全（positive + negative）且清理完成（cleanup_done）。两者缺一，降级 observed
    - observed：有现象但证据不足以确认；无 PoC 的发现一律落此档
    - rejected：复核否决的候选，只进报告附录
-2. 证据落盘：curl/nmap 原始输出写入 `engagement-demo/evidence/`，文件名带 EV 编号（如 `EV-003-robots-ftp.log`）；短输出可在 artifact 用 `inline:` 前缀内联引用。evidence.kind 只允许 command | screenshot | http_pair | log。
+2. 证据落盘：curl/nmap 原始输出写入 `<engagement_dir>/evidence/`（作业目录由 scope.yaml 所在目录决定，如 `engagement-demo/evidence/`），文件名带 EV 编号（如 `EV-003-robots-ftp.log`）；短输出可在 artifact 用 `inline:` 前缀内联引用。evidence.kind 只允许 command | screenshot | http_pair | log。
 3. 严重度校准（以实测报告为准绳）：匿名目录浏览=medium；CORS `*`=low；安全头缺失=low；存活确认/服务指纹/swagger 暴露=info。
 4. 完成判据：findings JSON 对照输出契约逐项自查通过，evidence 文件全部落盘。
 
@@ -109,5 +110,5 @@ findings 是 JSON 数组，字段严格符合 `secops_report/models.py` 的 Find
 
 - findings JSON 逐字段对照输出契约：evidence 是数组、status 三值之一、discovered_at 存在且带时区
 - 每个 confirmed 都有 poc.positive + poc.negative 且 cleanup_done=true，否则降级 observed
-- 证据文件已落盘 `engagement-demo/evidence/`，EV 编号连续、可复查
+- 证据文件已落盘 `<engagement_dir>/evidence/`（当前作业的 evidence 目录），EV 编号连续、可复查
 - 复查 audit 记录：本次全部动作都在 scope 授权与限速之内，无 BLOCK 后的绕行尝试

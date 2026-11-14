@@ -5,8 +5,14 @@ findings JSON -> 报告文件的一条命令流水线。dict -> Finding 的加�
 列表交给 render_markdown/render_sarif（由它们内部调 classify 定档），
 绝不把 classify 的返回值传进去——TASK-003 的既定契约。
 
-退出码契约：0 成功；2 输入错误（坏 JSON/缺必填字段/文件不可读等）；
-3 --strict 下没有任何 confirmed；其他意外异常兜底 1。
+TASK-018 新增 --whitebox-sarif 合并模式：提供白盒 SARIF 时走 merge 模块
+渲染统一报告（md 含白盒/黑盒双章节，SARIF 双 runs）；不提供时行为与
+TASK-004 交付形态完全一致。merge 的加载器复用本文件的 _load_findings
+（merge 侧反向 import，避免复制校验代码；故本文件不顶层 import merge，
+在 _run 内延迟导入以断循环）。
+
+退出码契约：0 成功；2 输入错误（坏 JSON/缺必填字段/文件不可读/白盒 SARIF
+结构非法等）；3 --strict 下没有任何 confirmed；其他意外异常兜底 1。
 """
 
 from __future__ import annotations
@@ -162,25 +168,41 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--strict", action="store_true",
         help="classify 后没有任何 confirmed 时退出码 3 且不生成报告（CI 卡无确认作业）")
+    parser.add_argument(
+        "--whitebox-sarif", default=None, metavar="PATH",
+        help="白盒 SARIF 2.1.0 文件（hermes-security 产出）；提供时输出"
+             "白盒+黑盒统一报告（TASK-018），缺省保持纯黑盒行为不变")
     return parser
 
 
 def _write_reports(findings: list[Finding], meta: dict[str, Any],
-                   out_prefix: str, fmt: str) -> list[str]:
+                   out_prefix: str, fmt: str,
+                   whitebox: dict[str, Any] | None = None) -> list[str]:
     """按 --format 落盘；输出目录不存在自动创建；返回生成的文件路径列表。
 
     契约：渲染器接收原始 Finding 列表，classify 由渲染器内部执行。
+    whitebox 非空（TASK-018）时走 merge 的统一报告渲染。
     """
     prefix = Path(out_prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
     if fmt in ("md", "both"):
         md_path = Path(f"{prefix}.md")
-        md_path.write_text(render_markdown(findings, meta), encoding="utf-8")
+        if whitebox is None:
+            md_text = render_markdown(findings, meta)
+        else:
+            from .merge import render_merged_markdown  # 延迟导入断循环
+            md_text = render_merged_markdown(findings, whitebox, meta)
+        md_path.write_text(md_text, encoding="utf-8")
         written.append(str(md_path))
     if fmt in ("sarif", "both"):
         sarif_path = Path(f"{prefix}.sarif")
-        sarif_path.write_text(render_sarif(findings), encoding="utf-8")
+        if whitebox is None:
+            sarif_text = render_sarif(findings)
+        else:
+            from .merge import render_merged_sarif  # 延迟导入断循环
+            sarif_text = render_merged_sarif(findings, whitebox)
+        sarif_path.write_text(sarif_text, encoding="utf-8")
         written.append(str(sarif_path))
     return written
 
@@ -189,6 +211,11 @@ def _run(args: argparse.Namespace) -> int:
     """主流程：加载 -> classify 统计 ->（strict 卡口）-> 渲染落盘 -> 摘要。"""
     findings = _load_findings(Path(args.findings))
     meta = _load_meta(Path(args.meta) if args.meta else None)
+
+    whitebox: dict[str, Any] | None = None
+    if args.whitebox_sarif:
+        from .merge import load_whitebox_sarif  # 延迟导入断循环
+        whitebox = load_whitebox_sarif(Path(args.whitebox_sarif))
 
     counts = Counter(classify(f).status for f in findings)
     confirmed = counts[FindingStatus.CONFIRMED]
@@ -200,10 +227,14 @@ def _run(args: argparse.Namespace) -> int:
               "（全部为 observed/rejected），--strict 下不生成报告", file=sys.stderr)
         return 3
 
-    written = _write_reports(findings, meta, args.out_prefix, args.format)
+    written = _write_reports(findings, meta, args.out_prefix, args.format,
+                             whitebox=whitebox)
     files = ", ".join(written)
-    print(f"{len(findings)} findings "
-          f"(confirmed={confirmed} observed={observed} rejected={rejected}) → {files}")
+    # 摘要行：缺省形态与 TASK-004 交付逐字一致（现有测试断言）；合并模式加
+    # "merged" 标记以区分
+    prefix = "merged; " if whitebox is not None else ""
+    print(f"{len(findings)} findings ({prefix}"
+          f"confirmed={confirmed} observed={observed} rejected={rejected}) → {files}")
     return 0
 
 

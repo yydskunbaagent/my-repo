@@ -8,6 +8,7 @@ findings.json"的流程。
 | --- | --- |
 | `task-schema.json` | 任务文件 schema（draft-07），与 `run_scan.py` 的手写校验**双重生效** |
 | `run_scan.py` | 扫描节点上的**唯一执行入口**（纯标准库，Python 3.11+） |
+| `dispatch.py` | 推理端的**投递/回收桥接**（TASK-017，纯标准库，一条命令走完时序 1–8 并完成回程脱敏） |
 | 仓库根 `Dockerfile.scanner` | 扫描镜像（debian + nmap + curl + python3；nuclei 按部署环境二选一放入，版本走 `ARG NUCLEI_VERSION`） |
 
 ## 一次完整作业的时序
@@ -143,6 +144,34 @@ findings.json"的流程。
 | `status` | 固定 `observed`（确认与否由推理端研判） |
 | `description` | `matcher-name` |
 | `evidence[0]` | `{kind: "log", summary: 原始 JSON 行前 200 字, artifact: ""}` |
+
+## dispatch.py：投递/回收桥接（TASK-017）
+
+`run_scan.py` 的运输层：本地预检 → 投递 → 触发容器 → 拉回 → **T002 脱敏 +
+T001 包域** → 归档，一条命令替代上面时序 2–8 的人工步骤（RUNBOOK §6）：
+
+```bash
+python deploy/protocol/dispatch.py --task task.json \
+    --host root@47.108.111.56 --port 53142 \
+    --out-dir engagement-demo/dispatch
+```
+
+归档布局（`<out-dir>/<task_id>/`）：`result.json`（T002 脱敏）、`raw/*.log`
+（逐文件脱敏）、`result.untrusted.txt`（T001 包域全文，供模型消费）、
+`dispatch.json`（投递元数据：远端 RC / 步骤耗时 / 掩码字段数 / 注入命中数）。
+
+- **只允许密钥认证**：ssh 强制 `-o BatchMode=yes`（无密钥当场失败，不可能
+  挂等密码输入），密码不出现在任何命令行。前置条件 `ssh-copy-id <扫描节点>`。
+- **固定远端命令模板**：远端只有 `mkdir` 与一条 `docker run`（模板尾部
+  `; echo RC=$?` 回传 run_scan 退出码），路径/镜像/网络参数全部过字符白名单。
+- **fail closed**：`validate_task` 不过 → 退出码 2，一个 ssh 都不发；传输
+  环节任一步失败 → 退出码 3，本地不留半套残缺归档（产物先落临时目录，
+  全部成功才进归档）。退出码：0 全链路成功（远端 RC=2 视为远端校验拒绝、
+  投递本身成功）；1 远端有动作失败（结果已拉回）；2 本地输入/校验错误；
+  3 投递/传输失败。
+- **raw/ 存在性以 result.json 为准**：有 `raw_output_ref` 引用而 raw 没拉到
+  = 证据残缺（退出码 3）；无引用则跳过（远端校验失败场景没有 raw/）。
+- 单测见 `tests/test_dispatch.py`（fake runner 注入，不触网不碰真实 ssh）。
 
 ## 约束与扩展
 

@@ -45,3 +45,9 @@
 - 结论：post_tool_call 是记录型钩子，Hermes 不消费其返回值（hermes-agent 源码核实：tool_executor 先 emit_post，替换发生在其后的 transform_tool_result），无法替换回传文本；任务书备选路径二（pre_tool_call 注入 system/context）同样不可行——Python 插件回调只认 block/approve/modify（modify 是浅合并进工具 args，会污染工具输入），没有注入通道
 - 落点：Hermes 既有的 transform_tool_result（model_tools.py："plugins may replace the final result string. Runs after post_tool_call and before the result enters context. first string return wins"，fail-open）——正是任务书所指"工具结果回传模型前的钩子点"；出网工具结果先 mask_text（T002）再 wrap_untrusted（T001），本地工具（is_local_tool）只脱敏不包域，首个包域结果携带一次性不可信数据条款
 - 代价：gate.py 对外新增 transform_tool_result（接口新增，pre/post 旧签名不变，本条即 AGENTS.md 要求的事前备案）；Hermes 对该钩子 fail-open——内部异常返回 None 保留原结果，损失纵深但不产生放行口子（出网动作仍由 pre_tool_call 硬判）
+
+## 011 untrusted.py 允许内嵌 mask_text 兜底副本：插件独立加载优先于"不复制代码"（2026-11-14 第四轮评审修复）
+- 结论：gate.py 顶层 `from .untrusted import ...` 且无兜底——untrusted 在导入阶段挂掉 = 整个门禁插件加载失败（等于门禁消失）。拷贝安装形态（hermes plugins install 复制目录）下 secops_report 不可达会让原实现必然挂掉，故 mask_text 改三级解析：常规导入 → 环境变量 SCOPE_GATE_REPO_ROOT / 父目录扫描 → 内嵌兜底副本
+- 理由：门禁消失比脱敏降级严重得多（脱敏只是纵深一层，出网动作仍由 pre_tool_call 硬判）；"不复制代码"原则在此让位于插件独立加载
+- 代价：masking 逻辑双份，漂移风险由 test_untrusted::test_fallback_mask_text_parity 守住（仓内形态逐条比对，改一边不改另一边即爆红）；域边界去活同步改为大小写不敏感（评审修复 2）
+- 反对记录：曾考虑"拷贝安装形态属假设、暂不修"——被 A2 实测的 GitHub 子目录安装形态直接反驳，该形态真实在用
