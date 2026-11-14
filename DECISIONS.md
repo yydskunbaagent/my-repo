@@ -40,3 +40,8 @@
 - 代价：allow_domains4/6 集合及其喂入随之删除；scope_feed 不带 --feed-pairs/--feed-ports 时不喂任何集合（喂集动作显式化，防误跑出半套放行条目）
 - netrange 目标（IP/CIDR）无域名语义，保留 ranges×ports 组合宽放行
 - 内联代码（-c/-e/--eval/-m 任一参数或解释器交互模式）同理类别性拦截（inline_code_execution）：目标校验对"可见合法目标 + 隐藏 sink"无能为力
+
+## 010 不可信数据层（T001/T002）接入点 = transform_tool_result，而非 post_tool_call（TASK-015）
+- 结论：post_tool_call 是记录型钩子，Hermes 不消费其返回值（hermes-agent 源码核实：tool_executor 先 emit_post，替换发生在其后的 transform_tool_result），无法替换回传文本；任务书备选路径二（pre_tool_call 注入 system/context）同样不可行——Python 插件回调只认 block/approve/modify（modify 是浅合并进工具 args，会污染工具输入），没有注入通道
+- 落点：Hermes 既有的 transform_tool_result（model_tools.py："plugins may replace the final result string. Runs after post_tool_call and before the result enters context. first string return wins"，fail-open）——正是任务书所指"工具结果回传模型前的钩子点"；出网工具结果先 mask_text（T002）再 wrap_untrusted（T001），本地工具（is_local_tool）只脱敏不包域，首个包域结果携带一次性不可信数据条款
+- 代价：gate.py 对外新增 transform_tool_result（接口新增，pre/post 旧签名不变，本条即 AGENTS.md 要求的事前备案）；Hermes 对该钩子 fail-open——内部异常返回 None 保留原结果，损失纵深但不产生放行口子（出网动作仍由 pre_tool_call 硬判）

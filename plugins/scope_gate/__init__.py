@@ -26,10 +26,21 @@ def post_tool_call(tool_name: str = "", args=None, result=None, **kwargs):
     return get_gate().post_tool_call(tool_name, args, result, **kwargs)
 
 
+def transform_tool_result(tool_name: str = "", args=None, result=None, **kwargs):
+    """T001/T002（TASK-015）：工具结果回传模型前的脱敏 + 不可信域包 wrapper。"""
+    from .gate import get_gate
+
+    return get_gate().transform_tool_result(tool_name, args, result, **kwargs)
+
+
 def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", pre_tool_call)
     ctx.register_hook("post_tool_call", post_tool_call)
-    logger.info("scope-gate %s 已注册（pre_tool_call / post_tool_call）", __version__)
+    ctx.register_hook("transform_tool_result", transform_tool_result)
+    logger.info(
+        "scope-gate %s 已注册（pre_tool_call / post_tool_call / transform_tool_result）",
+        __version__,
+    )
 
 
 def self_check() -> dict:

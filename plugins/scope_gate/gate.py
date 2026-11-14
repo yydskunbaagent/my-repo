@@ -1,12 +1,14 @@
 """钩子入口：把引擎、解析器、限速、审计装配起来。
 
-对外只暴露两个函数，签名严格遵循 Hermes `pre_tool_call` / `post_tool_call` 契约：
+对外暴露三个函数，签名严格遵循 Hermes hook 契约：
 
     pre_tool_call(tool_name, args, **kwargs)  -> Optional[dict]
-    post_tool_call(tool_name, args, result, **kwargs) -> None
+    post_tool_call(tool_name, args, result, **kwargs) -> None   （记录型，返回值不被消费）
+    transform_tool_result(tool_name, args, result, **kwargs) -> Optional[str]
 
 `pre_tool_call` 永不抛异常：任何内部错误都转成 block。因为 Hermes 对抛异常的处理是
 fail closed 但不给模型可读原因，模型会反复重试同一个调用；我们给结构化原因，让它能纠正。
+`transform_tool_result` 是 TASK-015（T001/T002）的接入点，取舍见 DECISIONS.md 010。
 """
 
 from __future__ import annotations
@@ -36,6 +38,13 @@ from .extract import (
 from .models import Action, Decision, DecisionKind, TargetKind
 from .ratelimit import RateLimiter
 from .scope import ScopeStore
+from .untrusted import (
+    UNTRUSTED_MAX_LEN,
+    UNTRUSTED_NOTICE,
+    detect_injection,
+    mask_text,
+    wrap_untrusted,
+)
 
 logger = logging.getLogger("scope_gate")
 
@@ -180,6 +189,10 @@ class ScopeGate:
         self.audit = AuditLog(config.audit_path)
         self.limiter = RateLimiter(config.rate_limit_db, clock=clock or time.monotonic)
         self.resolver = resolver or Resolver(config.dns_ttl, config.dns_timeout)
+        # T001 一次性条款开关（TASK-015）：首个包域结果携带 UNTRUSTED_NOTICE，
+        # 进程内一次。钩子在多个工具 worker 线程里并发跑，置位要加锁。
+        self._untrusted_notice_sent = False
+        self._untrusted_notice_lock = threading.Lock()
 
     # -- 路径保护 -----------------------------------------------------------
 
@@ -352,7 +365,18 @@ class ScopeGate:
     def post_tool_call(self, tool_name: str = "", args: Any = None, result: Any = None,
                        status: str = "", error_type: str = "", error_message: str = "",
                        duration_ms: Any = None, **kwargs: Any) -> None:
-        """只记录元信息，不落工具输出原文（避免凭据进审计库）。"""
+        """只记录元信息，不落工具输出原文（避免凭据进审计库）。
+
+        T001/T002（TASK-015）限制说明：本 hook 是记录型钩子——Hermes 不消费
+        post_tool_call 的返回值（hermes 源码核实：tool_executor 先 emit_post、
+        结果另行提交，替换发生在其后的 transform_tool_result），因此无法在此
+        把脱敏/包域后的文本回传给模型，即任务书所说"T001 需在工具结果回传
+        模型前的钩子点接入"。任务书备选路径二（pre_tool_call 给 system/context
+        注入一次性条款）经源码核实同样不可行：Python 插件回调只认
+        block/approve/modify（modify 是浅合并进工具 args，会污染工具输入），
+        没有 system/context 注入通道。实际接入点为 transform_tool_result（见
+        下方同名方法与 DECISIONS.md 010）。
+        """
         try:
             text = result if isinstance(result, str) else str(result or "")
             self.audit.append("tool_result", {
@@ -367,6 +391,82 @@ class ScopeGate:
             })
         except Exception:
             logger.exception("post_tool_call 审计失败")
+
+    def transform_tool_result(
+        self, tool_name: str = "", args: Any = None, result: Any = None,
+        status: str = "", error_type: str = "", error_message: str = "",
+        duration_ms: Any = None, **kwargs: Any,
+    ) -> Optional[str]:
+        """T001/T002（TASK-015）实际接入点：工具结果回传模型前的替换钩子。
+
+        Hermes 的 transform_tool_result 契约（hermes 源码 model_tools.py 核实）：
+        在 post_tool_call 之后、结果进入上下文之前触发；"plugins may replace the
+        final result string"，first string return wins；对异常 fail-open（保留
+        原结果）。任务书备选路径（post hook 替换 / pre hook 注入条款）均经源码
+        核实不可行，取舍记录见 DECISIONS.md 010。
+
+        处理规则（任务书 TASK-015）：
+          - 出网工具（terminal/url 抓取/browser 及一切非本地工具，与 extract 的
+            "默认按出网"哲学一致）：先 mask_text（T002 凭据）再 wrap_untrusted
+            （T001 包域）；首个包域结果额外携带一次性的 UNTRUSTED_NOTICE 条款。
+          - 本地工具（is_local_tool，含 read_file）：只 mask_text 不包域——本地
+            文件本来就在自己控制面里，包域反而污染；注入关键词命中仍记审计。
+        返回 None 表示不替换（本地结果未变 / 非 str 结果 / 内部错误）。
+        """
+        try:
+            # 非 str 结果（多模态 dict 等）不动：改写其结构语义的风险大于脱敏收益
+            if not isinstance(result, str) or not result:
+                return None
+            name = (tool_name or "").strip()
+            low = name.lower()
+            is_local = (
+                low in LOCAL_READ_TOOLS or low in LOCAL_WRITE_TOOLS
+                or is_local_tool(low)
+            )
+
+            masked = mask_text(result)
+            hits = detect_injection(masked)
+            if is_local:
+                out = masked
+                truncated = False
+                wrapped = False
+            else:
+                truncated = len(masked) > UNTRUSTED_MAX_LEN
+                out = wrap_untrusted(masked, source_tool=name or "unknown")
+                wrapped = True
+                with self._untrusted_notice_lock:
+                    first = not self._untrusted_notice_sent
+                    self._untrusted_notice_sent = True
+                if first:
+                    out = f"{UNTRUSTED_NOTICE}\n{out}"
+
+            if out != result or wrapped or hits:
+                # 纯透传（本地结果无凭据无命中）不记审计，避免噪音
+                self._record_transform(name, masked=masked != result, wrapped=wrapped,
+                                       truncated=truncated, injection=hits,
+                                       result_chars=len(out) if out != result else len(result))
+            return out if out != result else None
+        except Exception:
+            # Hermes 对本钩子 fail-open：异常时返回 None = 保留原结果。
+            # 凭据脱敏/包域缺失只损失纵深，不产生放行口子（出网动作仍由
+            # pre_tool_call 硬判）；审计链里留 transform 记录缺失可定位。
+            logger.exception("transform_tool_result 处理失败，保留原结果")
+            return None
+
+    def _record_transform(self, tool: str, *, masked: bool, wrapped: bool,
+                          truncated: bool, injection: list, result_chars: int) -> None:
+        """transform 结果的审计元数据（只记元信息，不落输出原文）。"""
+        try:
+            self.audit.append("result_transform", {
+                "tool": tool,
+                "masked": masked,
+                "wrapped": wrapped,
+                "truncated": truncated,
+                "injection": injection,
+                "result_chars": result_chars,
+            })
+        except Exception:
+            logger.exception("result_transform 审计失败")
 
     # -- 内部 ---------------------------------------------------------------
 
