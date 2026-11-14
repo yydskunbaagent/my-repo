@@ -1,0 +1,29 @@
+# TASK-014: CI 强制执行测试契约（本地与 CI 同一条命令）。
+# 不装项目本体（禁止 pip install -e .）；pyyaml 是测试依赖（conftest/插件
+# 解析 scope.yaml 需要，同 make setup），故与 pytest 一起安装。
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # 不启用 cache: pip —— 需以 pyproject/requirements 作为 key，
+          # 本仓不存在，启用会直接报错（降级即不缓存）。
+
+      - name: Install test dependencies
+        run: python -m pip install pytest pyyaml
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
