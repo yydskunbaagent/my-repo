@@ -10,6 +10,12 @@ TASK-012 补充：terminal 里逐段皆为本地白名单命令的调用（ls/ca
 status 等）is_local_shell 置位，跳过目标提取与 no_target 判定——os.path.join、
 python-3.14* 这类标识符/版本号不再被误解析成域名/IP；白名单外的形态照旧走
 目标校验。execute_code 类任意代码执行工具由 gate 类别性拦截（工具级同类问题）。
+
+TASK-013 补充：\r?\n 同样是命令分隔符——多行命令逐段判定，is_local_shell 要求
+每段首词皆命中白名单（`ls\ncurl evil.com` 不再借首词逃逸），curl 段的目标照常
+提取；script_path 判定改为逐段遍历（`curl ... && bash /tmp/evil.sh` 不再借整体
+首词逃逸）且取消扩展名过滤（无后缀脚本同样是脚本文件），多段命令命中时以
+seg#N: 标注段序号便于审计定位。
 """
 
 from __future__ import annotations
@@ -184,14 +190,19 @@ def _first_token(cmd: str) -> str:
 
 
 def _segments(cmd: str) -> List[str]:
-    """按 shell 元字符切段，避免 `curl a.com; curl evil.com` 只看到第一个。"""
-    return [s.strip() for s in re.split(r"\s*(?:&&|\|\||;|\||&)\s*", cmd) if s.strip()]
+    """按 shell 元字符切段，避免 `curl a.com; curl evil.com` 只看到第一个。
+
+    TASK-013：\r?\n 同样是分隔符——`ls -la\ncurl evil.com` 换行后的命令
+    不再与首段共享首词。
+    """
+    return [s.strip() for s in re.split(r"\s*(?:&&|\|\||;|\||&|\r?\n)\s*", cmd) if s.strip()]
 
 
 def _is_local_shell_command(cmd: str) -> bool:
     """整条命令是否全部由本地白名单命令组成（TASK-012）。
 
-    逐段判定：任一段首词不在白名单（如 `ls && curl evil.com` 的 curl），
+    逐段判定：任一段首词不在白名单（如 `ls && curl evil.com` 的 curl，或
+    TASK-013 的换行形态 `ls\ncurl evil.com`——\r?\n 与 &&/; 等同为分隔符），
     整条按普通出网处理——与 TASK-007 内联判定的逐段思路一致，防止借首词
     逃逸。段内再排除逃逸特征：命令替换/进程替换、/dev/tcp(udp) 网络伪设备、
     find -exec 类任意执行参数、git 网络子命令与 alias 配置、env 带命令形态
@@ -277,22 +288,31 @@ def analyze_terminal(command: str) -> Analysis:
             forbidden=forbidden,
         )
 
-    # 脚本执行：命令行只看得到 `bash scan.sh`，目标藏在脚本里 —— 这是最典型的逃逸路径
+    # 脚本执行：命令行只看得到 `bash scan.sh`，目标藏在脚本里 —— 这是最典型的逃逸路径。
+    # TASK-013 修正：逐段遍历——`curl ... && bash /tmp/evil.sh` 的整体首词是 curl，
+    # 只看整条首词会漏掉后段的脚本执行。参数判定取消扩展名过滤（无后缀脚本同样
+    # 是脚本文件）：解释器后的第一个非选项参数一律视为脚本。命中 -c/-e/--eval/-m
+    # 内联开关则该段不记 script_path，由下方 inline_eval 判定类别性拦截（TASK-007）。
+    # 多段命令以 seg#N: 标注段序号便于审计定位，单段命令保持裸路径（与既有形态
+    # 一致）；命中即停——gate 对 script_path 非空一律拒绝，多脚本不必逐一列出。
     script_path = ""
-    tok = _first_token(cmd)
-    if tok in _SCRIPT_INTERPRETERS:
+    segs = _segments(cmd)
+    for idx, seg in enumerate(segs, start=1):
+        if _first_token(seg) not in _SCRIPT_INTERPRETERS:
+            continue
         try:
-            parts = shlex.split(cmd, posix=not os.name == "nt")
+            parts = shlex.split(seg, posix=not os.name == "nt")
         except ValueError:
-            parts = cmd.split()
+            parts = seg.split()
         for arg in parts[1:]:
-            if arg in ("-c", "-e", "--eval", "-m"):
+            if arg in _INLINE_EXEC_FLAGS:
                 break
             if arg.startswith("-"):
                 continue
-            if arg.lower().endswith((".sh", ".py", ".ps1", ".pl", ".rb", ".js")):
-                script_path = arg
-                break
+            script_path = arg if len(segs) == 1 else f"seg#{idx}:{arg}"
+            break
+        if script_path:
+            break
 
     # 内联执行判定（TASK-007）：解释器 + -c/-e/--eval/-m 任一参数，或除解释器外
     # 无任何参数（交互模式）。逐段判定——`curl a.com && python3 -c '...'` 的整体

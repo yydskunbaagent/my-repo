@@ -45,7 +45,9 @@ _PREFIXED_RE = re.compile(
 _GHP_RE = re.compile(r"\bghp_[A-Za-z0-9]{8,}")
 # (?i) 只圈住 bearer 字面量（TASK-007：小写形态必须命中）；两个捕获组的
 # 结构保持不变——_mask_bearer 依赖 group(1)=前缀、group(2)=token。
-_BEARER_RE = re.compile(r"\b((?i:bearer)\s+)([A-Za-z0-9._-]{8,})")
+# 字符类含 Base64 的 +//=/（TASK-013）：bearer YWJj...NDU= 形态此前因 = 不在
+# 字符类而漏掩。
+_BEARER_RE = re.compile(r"\b((?i:bearer)\s+)([A-Za-z0-9._+/=-]{8,})")
 
 # URL 查询串：参数名不分大小写；值到 & 或空白为止。
 _QUERY_RE = re.compile(
