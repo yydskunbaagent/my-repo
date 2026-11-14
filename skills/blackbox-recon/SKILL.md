@@ -4,7 +4,7 @@ description: 对已授权 HTTP 目标执行三阶段主动侦察并产出合规 
 version: 0.1.0
 author: yydskunbaagent, Hermes Agent
 license: MIT
-platforms: [linux]
+platforms: [windows, linux]
 metadata:
   hermes:
     tags: [security, recon, blackbox, scope-gate]
