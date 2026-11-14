@@ -36,7 +36,7 @@ findings.json"的流程。
                                                                         5. 逐条动作以参数列表
                                                                            执行（nmap / nuclei /
                                                                            curl_probe，禁止 shell）；
-                                                                           nuclei -json 命中行
+                                                                           nuclei -json/-jsonl 命中行
                                                                            → findings 自动提取
                                                                         6. 聚合写 result.json，
                                                                            原始输出落 raw/
@@ -77,7 +77,8 @@ findings.json"的流程。
   `kind`（目前只支持 `http`/`https`，curl_probe 的 URL scheme 来源）。
 - `actions[]`：`tool` 白名单枚举，白名单外一律拒绝；nmap/nuclei 用 `args`、
   curl_probe 用 `paths`（以 `/` 开头），二者互斥；args/paths 逐元素禁
-  `;` `` ` `` `$(`；nuclei 动作必须带 `-json`（findings 提取依赖 JSONL）。
+  `;` `` ` `` `$(`；nuclei 动作必须带 `-json` 或 `-jsonl`（nuclei v3 起
+  JSONL 参数为 `-jsonl`，两种 flag 输出格式相同；findings 提取依赖逐行 JSONL）。
 - `created_at`/`expires_at`：ISO8601（建议带时区，缺省按 UTC）；`expires_at`
   不得早于 `created_at`，且不得早于执行时刻。
 - `--timeout`（默认 600s）为整任务预算：动作之间检查剩余预算，单条命令最多

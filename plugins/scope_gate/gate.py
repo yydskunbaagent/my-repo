@@ -15,6 +15,7 @@ import concurrent.futures
 import ipaddress
 import logging
 import os
+import shlex
 import socket
 import threading
 import time
@@ -41,6 +42,13 @@ logger = logging.getLogger("scope_gate")
 DNS_TTL_SECONDS = 300
 DNS_TIMEOUT_SECONDS = 4.0
 MAX_CACHE_ENTRIES = 2048
+
+# execute_code 类工具（TASK-012）：任意代码执行，目标无法可靠提取，一律拒绝。
+# 与 TASK-007 的 terminal 内联拦截（-c/-e/--eval/-m）构成同一防线：那是命令行
+# 形态，这是工具级同类问题。比较统一小写（strip 后）。
+_CODE_EXECUTION_TOOLS = frozenset({"execute_code", "code_exec", "python_exec"})
+# shell 操作符 token：本地 shell 命令的保护路径检查里跳过它们（不是路径）
+_SHELL_OPERATOR_TOKENS = frozenset({">", ">>", "<", "<<", "|", "||", "&", "&&", ";"})
 
 
 @dataclass
@@ -146,6 +154,22 @@ class Resolver:
         self._pool.shutdown(wait=False, cancel_futures=True)
 
 
+def _shell_arg_paths(command: str) -> Tuple[str, ...]:
+    """本地 shell 命令的路径参数候选（TASK-012 保护路径检查用）。
+
+    切词后取非选项、非 shell 操作符的 token，宁滥勿缺：_protected 靠
+    resolve 后精确比对，多余 token 无副作用，漏掉的才是风险。
+    """
+    try:
+        parts = shlex.split(command, posix=not os.name == "nt")
+    except ValueError:
+        parts = command.split()
+    return tuple(
+        p for p in parts
+        if p and not p.startswith("-") and p not in _SHELL_OPERATOR_TOKENS
+    )
+
+
 class ScopeGate:
     def __init__(self, config: GateConfig, *, resolver: Optional[Resolver] = None,
                  clock=None):
@@ -193,6 +217,17 @@ class ScopeGate:
     def evaluate(self, tool_name: str, args: Any) -> Decision:
         args = args if isinstance(args, dict) else {}
 
+        # execute_code 类工具（TASK-012）：任意代码执行、目标无法可靠提取，
+        # 类别性一律拒绝（与 TASK-007 内联拦截同一防线，工具级同类问题）。
+        # 放在一切判定之前：任何 args、任何 scope 状态下都 block。
+        if (tool_name or "").strip().lower() in _CODE_EXECUTION_TOOLS:
+            return Decision(
+                DecisionKind.BLOCK, "code_execution_tool",
+                "[scope-gate] 被拒绝：execute_code 是任意代码执行，目标无法可靠提取，"
+                "扫描节点禁用。请使用任务协议（deploy/protocol/run_scan.py）的"
+                "原子动作白名单。",
+            )
+
         # 本地只读：直接放行（但仍记账）
         if tool_name in LOCAL_READ_TOOLS:
             return Decision(DecisionKind.ALLOW, "local_read", "")
@@ -238,6 +273,22 @@ class ScopeGate:
                 "[scope-gate] 被拒绝：扫描节点不允许内联代码执行，请使用预授权的原子工具。"
                 "内联形态（-c/-e/--eval/-m 或交互模式）里的真实目标无法在命令行静态校验。",
             )
+
+        # 终端本地命令白名单（TASK-012）：逐段皆为本地命令 -> 纯本地操作，
+        # 跳过目标提取 / no_target / 限速记账（analyze_terminal 已不提取目标）。
+        # forbidden（rm -rf / 类毁灭性命令）不豁免：仅 forbidden 为空才走此
+        # 早退，命中 forbidden 落到下方正常判定路径由 decide 优先拒绝；
+        # 保护路径检查照常生效——本地命令读写删作业元数据（scope/审计）仍拦。
+        if analysis.is_local_shell and not analysis.forbidden:
+            hit = self._protected(_shell_arg_paths(analysis.command))
+            if hit:
+                return Decision(
+                    DecisionKind.BLOCK, "protected_path",
+                    f"[scope-gate] 被拒绝：本地命令涉及作业元数据 {hit}"
+                    f"（scope / 授权书 / 审计），不得读写或删除。"
+                    f"请把产出写到 evidence/ 或 reports/ 下。",
+                )
+            return Decision(DecisionKind.ALLOW, "local_shell", "")
 
         resolved: Dict[str, Tuple[str, ...]] = {}
         unresolvable = []

@@ -58,6 +58,9 @@ HOST_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 
 DEFAULT_TIMEOUT_SECONDS = 600
 CURL_REQUEST_TIMEOUT_SECONDS = 15
+# curl exit 18（CURLE_PARTIAL_FILE，TASK-012）：大响应体截断，但状态码与
+# 响应头已到手——视为"成功但部分截断"，不算动作失败
+CURL_PARTIAL_EXIT_CODE = 18
 NUCLEI_EVIDENCE_SUMMARY_CHARS = 200
 RAW_DIR_NAME = "raw"
 
@@ -152,7 +155,7 @@ def _validate_paths(paths: Any, where: str, errors: list[str]) -> None:
 
 
 def _validate_actions(actions: Any, errors: list[str]) -> None:
-    """actions 数组校验：白名单、工具-字段配对、禁止字符、nuclei 必带 -json。"""
+    """actions 数组校验：白名单、工具-字段配对、禁止字符、nuclei 必带 -json/-jsonl。"""
     if actions is None:
         return
     if not isinstance(actions, list) or not actions:
@@ -196,8 +199,10 @@ def _validate_actions(actions: Any, errors: list[str]) -> None:
                 problem = _arg_problem(arg)
                 if problem:
                     errors.append(f"{where}.args[{j}] {problem}: {arg!r}")
-            if tool == "nuclei" and "-json" not in args:
-                errors.append(f"{where}: nuclei 动作必须带 -json"
+            # nuclei v3 起 JSONL 输出参数是 -jsonl（-json 在 v3 已移除，TASK-012）；
+            # 两种 flag 输出格式相同（逐行 JSON），向后兼容 -json（v2 写法）
+            if tool == "nuclei" and not ({"-json", "-jsonl"} & set(args)):
+                errors.append(f"{where}: nuclei 动作必须带 -json 或 -jsonl"
                               "（findings 自动提取依赖逐行 JSONL 输出）")
 
 
@@ -260,7 +265,7 @@ def validate_task(task: Any, now: datetime | None = None) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def parse_nuclei_findings(stdout: str, discovered_at: str) -> list[dict[str, Any]]:
-    """从 nuclei -json（JSONL）输出逐行提取 findings。
+    """从 nuclei -json/-jsonl（JSONL）输出逐行提取 findings。
 
     映射（对齐 secops_report 的 Finding 字段）：title=template-id（旧版
     templateID 兜底）、target=matched-at（url / matched 兜底）、severity=nuclei
@@ -445,6 +450,8 @@ def _run_action(
 
     # curl_probe：对每个 (目标端口 × path) 发 GET，记录状态码 + 响应头。
     # 响应体丢弃（-o /dev/null），只留头与状态码——证据定性是"现象"，不是内容转储。
+    # exit 18（CURLE_PARTIAL_FILE，TASK-012）：响应体截断但状态码/响应头已
+    # 到手，算探测成功，请求条目与 raw 日志标注 partial；仅连接错误/超时算失败。
     urls = build_curl_urls(targets, action["paths"])
     if not urls:
         # 正常经 validate_task 的任务到不了这里（targets 非空且 kind 只有
@@ -467,6 +474,7 @@ def _run_action(
                f"{min(remaining, float(CURL_REQUEST_TIMEOUT_SECONDS)):.3f}", url]
         result = run_fn(cmd, remaining)
         status_code, headers = parse_curl_headers(result["stdout"])
+        partial = result["exit_code"] == CURL_PARTIAL_EXIT_CODE
         request: dict[str, Any] = {
             "url": url,
             "exit_code": result["exit_code"],
@@ -474,16 +482,30 @@ def _run_action(
             "headers": headers,
             "duration_s": result["duration_s"],
         }
+        if partial:
+            request["partial"] = True
+            request["note"] = ("exit 18（CURLE_PARTIAL_FILE）：响应体截断，"
+                               "状态码与响应头已获取")
         if result["timed_out"]:
             request["error"] = "请求超时（--max-time / 任务预算耗尽）"
         requests.append(request)
-        chunks.append(_raw_dump(cmd, result))
+        chunk = _raw_dump(cmd, result)
+        if partial:
+            chunk += "\npartial=1（exit_code=18 CURLE_PARTIAL_FILE：响应体截断，响应头已完整获取）\n"
+        chunks.append(chunk)
     entry["duration_s"] = time.monotonic() - started
     entry["requests"] = requests
     entry["raw_output_ref"] = _write_raw(
         raw_dir, f"{index:02d}-{tool}.log", "\n\n====\n\n".join(chunks))
+    # 聚合（TASK-012）：exit 0 = 成功；exit 18 且状态码已到手 = 成功但截断
+    # （partial）；其余（连接错误/超时/预算耗尽）= 失败，动作整体 exit 1。
     entry["exit_code"] = 0 if all(
-        r["exit_code"] == 0 and "error" not in r for r in requests) else 1
+        "error" not in r
+        and (r["exit_code"] == 0
+             or (r.get("partial") and r["status_code"] is not None))
+        for r in requests) else 1
+    if any(r.get("partial") for r in requests):
+        entry["partial"] = True
     return entry, []
 
 
@@ -517,7 +539,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  python3 run_scan.py --task task.json --out result.json --timeout 300\n"
             "\n"
             "校验失败或任务过期 -> 不执行任何动作，result.json 只写 error（退出码 2）。\n"
-            "自动 findings 只来自 nuclei -json 的模板命中（status=observed）；\n"
+            "自动 findings 只来自 nuclei -json/-jsonl 的模板命中（status=observed）；\n"
             "nmap/curl_probe 输出只进 raw/ 目录，由推理端研判。协议细节见\n"
             "deploy/protocol/README.md 与同目录 task-schema.json。\n"
             "退出码：0 全部成功；1 有动作失败/超时；2 校验失败/输入错误。\n"

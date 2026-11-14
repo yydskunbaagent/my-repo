@@ -5,6 +5,11 @@
 
 TASK-010 补充：明确列入 LOCAL_TOOLS 的本地类工具（不出网）跳过目标提取与
 no_target 判定（is_local_tool）；清单外的未知工具仍默认按出网处理，策略不变。
+
+TASK-012 补充：terminal 里逐段皆为本地白名单命令的调用（ls/cat/grep/git
+status 等）is_local_shell 置位，跳过目标提取与 no_target 判定——os.path.join、
+python-3.14* 这类标识符/版本号不再被误解析成域名/IP；白名单外的形态照旧走
+目标校验。execute_code 类任意代码执行工具由 gate 类别性拦截（工具级同类问题）。
 """
 
 from __future__ import annotations
@@ -67,6 +72,31 @@ _SCRIPT_INTERPRETERS = frozenset({"bash", "sh", "zsh", "dash", "python", "python
 # 内联代码里"可见合法目标 + 隐藏 sink"（如 'http://'+'x'+'.com' 拼接）无法
 # 静态提取，只能类别性拦截，不能靠目标校验兜底。
 _INLINE_EXEC_FLAGS = frozenset({"-c", "-e", "--eval", "-m"})
+
+# 终端本地命令白名单（TASK-012）：逐段命中的 terminal 调用是纯本地操作，
+# 不出网——参数里的 os.path.join、python-3.14* 这类标识符/版本号此前会被
+# 误解析成域名/IP 而 no_target/越界误拦（2026-11-14 A6 复测证据）。
+# 白名单豁免的只是目标提取与限速记账；forbidden 关键词（rm -rf / 类）与
+# 保护路径检查不豁免。
+_LOCAL_SHELL_COMMANDS = frozenset({
+    "ls", "dir", "pwd", "cd", "cat", "type", "head", "tail", "wc", "echo",
+    "grep", "find", "stat", "file", "md5sum", "sha256sum", "touch", "mkdir",
+    "cp", "mv", "rm", "rmdir", "git", "diff", "sort", "uniq", "which", "where",
+    "ps", "env", "date", "whoami", "uname", "hostname", "df", "du", "free",
+})
+# 白名单的逃逸特征（TASK-012）：命中任一即整条按普通出网处理——宁可走原
+# 校验路径，也不豁免能引出第二条命令/网络通道的形态。命令替换（`、$()、
+# 进程替换（<(/>( 能执行任意命令；/dev/tcp、/dev/udp 是 bash 的网络伪设备
+# （echo x > /dev/tcp/host/port 即出网）。
+_LOCAL_SHELL_ESCAPE_PATTERN = re.compile(r"(`|\$\(|<\(|>\(|/dev/tcp/|/dev/udp/)")
+# find 风格的任意执行参数：-exec 里的命令不经门禁判定
+_LOCAL_SHELL_EXEC_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+# git 的网络子命令（clone/fetch/push 等）与 alias 配置（alias 可内嵌 `!shell`
+# 逃逸）都能发起白名单之外的网络操作，按普通命令处理
+_GIT_NETWORK_SUBCOMMANDS = frozenset({
+    "clone", "fetch", "pull", "push", "ls-remote", "submodule",
+    "request-pull", "send-email", "svn", "p4",
+})
 
 # 委派类工具：父 Agent 把子任务文本转交子 Agent。文本里提得出目标就按目标判，
 # 提不出目标不算解析失败——子任务的出网动作由子 Agent 的门禁把关（TASK-005 缺陷 1）。
@@ -137,6 +167,7 @@ class Analysis:
     command: str = ""
     script_path: str = ""
     inline_eval: bool = False    # 解释器内联执行/交互模式（TASK-007：类别性拦截）
+    is_local_shell: bool = False  # 纯本地 shell 命令（TASK-012：白名单豁免提取/限速）
     forbidden: str = ""          # 非空表示命中违规类别（dos/exfil/persistence/lateral）
     parse_error: str = ""
     notes: List[str] = field(default_factory=list)
@@ -155,6 +186,42 @@ def _first_token(cmd: str) -> str:
 def _segments(cmd: str) -> List[str]:
     """按 shell 元字符切段，避免 `curl a.com; curl evil.com` 只看到第一个。"""
     return [s.strip() for s in re.split(r"\s*(?:&&|\|\||;|\||&)\s*", cmd) if s.strip()]
+
+
+def _is_local_shell_command(cmd: str) -> bool:
+    """整条命令是否全部由本地白名单命令组成（TASK-012）。
+
+    逐段判定：任一段首词不在白名单（如 `ls && curl evil.com` 的 curl），
+    整条按普通出网处理——与 TASK-007 内联判定的逐段思路一致，防止借首词
+    逃逸。段内再排除逃逸特征：命令替换/进程替换、/dev/tcp(udp) 网络伪设备、
+    find -exec 类任意执行参数、git 网络子命令与 alias 配置、env 带命令形态
+    （`env curl ...` 会在白名单之外执行程序）。
+    """
+    if _LOCAL_SHELL_ESCAPE_PATTERN.search(cmd):
+        return False
+    for seg in _segments(cmd):
+        try:
+            parts = shlex.split(seg, posix=not os.name == "nt")
+        except ValueError:
+            parts = seg.split()
+        if not parts:
+            return False
+        tok = os.path.basename(parts[0]).lower()
+        if tok not in _LOCAL_SHELL_COMMANDS:
+            return False
+        args = parts[1:]
+        if any(a in _LOCAL_SHELL_EXEC_FLAGS for a in args):
+            return False
+        if tok == "git":
+            if any("alias." in a for a in args):
+                return False
+            sub = next((a for a in args if not a.startswith("-")), "")
+            if sub.lower() in _GIT_NETWORK_SUBCOMMANDS:
+                return False
+        if tok == "env" and any(not a.startswith("-") and "=" not in a
+                                for a in args):
+            return False
+    return True
 
 
 def _action_for_command(cmd: str) -> Action:
@@ -195,6 +262,20 @@ def analyze_terminal(command: str) -> Analysis:
         forbidden = "exfil"
     elif _DOS.search(cmd):
         forbidden = "dos"
+
+    # 本地 shell 白名单（TASK-012）：逐段皆为本地命令且无逃逸特征 -> 整条
+    # 按纯本地处理：不提取目标（os.path.join / python-3.14* 不再误解析成
+    # 域名/IP）。script/inline 判定天然不命中（白名单与解释器无交集），
+    # 直接早退。forbidden 已在上面先行计算——rm -rf / 类毁灭性命令照常随
+    # Analysis 带出，由 gate/decide 优先拒绝，白名单不豁免 forbidden。
+    if _is_local_shell_command(cmd):
+        return Analysis(
+            action=Action.RECON_PASSIVE,
+            targets=(),
+            command=cmd,
+            is_local_shell=True,
+            forbidden=forbidden,
+        )
 
     # 脚本执行：命令行只看得到 `bash scan.sh`，目标藏在脚本里 —— 这是最典型的逃逸路径
     script_path = ""

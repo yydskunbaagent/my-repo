@@ -476,3 +476,103 @@ def test_main_help_exits_zero(capsys):
     assert exc.value.code == 0
     out = capsys.readouterr().out
     assert "--task" in out and "--timeout" in out
+
+
+# ---- TASK-012 任务 0：nuclei -jsonl 校验 + curl_probe exit 18 ----------------
+
+
+def test_validate_accepts_nuclei_jsonl_flag():
+    """nuclei v3.3.9 的 JSONL 参数是 -jsonl（-json 在 v3 已移除）：带 -jsonl 通过。"""
+    task = _task(actions=[{"tool": "nuclei",
+                           "args": ["-u", "http://10.10.0.100:3000", "-jsonl", "-silent"]}])
+    assert run_scan.validate_task(task, now=NOW) == []
+
+
+def test_validate_accepts_nuclei_json_flag_backcompat():
+    """向后兼容：-json（v2 写法）与 v2/v3 混用同样通过校验。"""
+    task = _task(actions=[
+        {"tool": "nuclei", "args": ["-u", "http://10.10.0.100:3000", "-json"]},
+    ])
+    assert run_scan.validate_task(task, now=NOW) == []
+
+
+def test_validate_rejects_nuclei_with_neither_flag():
+    """两种 flag 都缺才拒，报错提示同步更新为 -json 或 -jsonl。"""
+    task = _task(actions=[{"tool": "nuclei",
+                           "args": ["-u", "http://10.10.0.100:3000", "-silent"]}])
+    errors = _validate_errors(task)
+    assert "-jsonl" in errors
+
+
+def test_schema_accepts_nuclei_jsonl_rule_sync():
+    """schema 与脚本双重校验同源：schema 的 nuclei 规则同时接受 -json 与 -jsonl。"""
+    schema = _load_schema()
+    all_of = schema["properties"]["actions"]["items"]["allOf"]
+    nuclei_rules = [r for r in all_of
+                    if r.get("if", {}).get("properties", {})
+                    .get("tool", {}).get("const") == "nuclei"]
+    assert len(nuclei_rules) == 1
+    contains_consts = nuclei_rules[0]["then"]["properties"]["args"]["anyOf"]
+    assert {c["contains"]["const"] for c in contains_consts} == {"-json", "-jsonl"}
+
+
+def test_run_action_curl_probe_partial_exit_18_is_success(tmp_path):
+    """exit 18（CURLE_PARTIAL_FILE）：状态码/响应头已到手 -> 动作 success 且标注 partial。"""
+    run_fn, _calls = _fake_run(stdout=CURL_HEADERS_OK, exit_code=18)
+    action = {"tool": "curl_probe", "paths": ["/", "/robots.txt"]}
+    entry, _findings = run_scan._run_action(
+        0, action, _task()["targets"], _deadline(), run_fn, tmp_path / "raw", "t")
+    assert entry["exit_code"] == 0
+    assert entry.get("partial") is True
+    assert all(r.get("partial") is True for r in entry["requests"])
+    assert [r["status_code"] for r in entry["requests"]] == [200, 200]
+    assert all("error" not in r for r in entry["requests"])
+    raw = (tmp_path / "raw" / "00-curl_probe.log").read_text(encoding="utf-8")
+    assert "partial" in raw.lower()  # raw 日志标注 partial
+
+
+def test_run_action_curl_probe_partial_without_headers_still_fails(tmp_path):
+    """exit 18 但连响应头都没拿到（状态码 None）-> 不算探测成功（fail closed）。"""
+    run_fn, _calls = _fake_run(stdout="", exit_code=18)
+    entry, _findings = run_scan._run_action(
+        0, {"tool": "curl_probe", "paths": ["/"]}, _task()["targets"],
+        _deadline(), run_fn, tmp_path / "raw", "t")
+    assert entry["exit_code"] == 1
+
+
+def test_run_action_curl_probe_mixed_partial_and_failure(tmp_path):
+    """partial 与真失败混合：任一请求彻底失败 -> 动作整体仍 exit 1。"""
+    outcomes = {"exit_code": 18, "stdout": CURL_HEADERS_OK, "stderr": "",
+                "duration_s": 0.05, "timed_out": False}
+
+    def run_fn(cmd: list[str], timeout_s: float) -> dict:
+        result = dict(outcomes)
+        if cmd[-1].endswith("/robots.txt"):
+            result = {"exit_code": 7, "stdout": "", "stderr": "conn refused",
+                      "duration_s": 0.01, "timed_out": False}
+        return result
+
+    entry, _findings = run_scan._run_action(
+        0, {"tool": "curl_probe", "paths": ["/", "/robots.txt"]},
+        _task()["targets"], _deadline(), run_fn, tmp_path / "raw", "t")
+    assert entry["exit_code"] == 1
+
+
+def test_main_curl_partial_exit_18_returns_zero(tmp_path, monkeypatch):
+    """整任务视角：curl exit 18 不再把动作记为失败（退出码 0，partial 有标注）。"""
+
+    def partial_run(cmd: list[str], timeout_s: float) -> dict:
+        assert cmd[0] == "curl"
+        return {"exit_code": 18, "stdout": CURL_HEADERS_OK, "stderr": "",
+                "duration_s": 0.05, "timed_out": False}
+
+    monkeypatch.setattr(run_scan, "_run_command", partial_run)
+    task_path = tmp_path / "task.json"
+    out_path = tmp_path / "result.json"
+    task_path.write_text(json.dumps(_task(actions=[
+        {"tool": "curl_probe", "paths": ["/"]},
+    ])), encoding="utf-8")
+    assert run_scan.main(["--task", str(task_path), "--out", str(out_path)]) == 0
+    result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert result["actions"][0]["exit_code"] == 0
+    assert result["actions"][0]["partial"] is True
