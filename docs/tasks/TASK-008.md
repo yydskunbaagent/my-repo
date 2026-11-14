@@ -18,7 +18,7 @@
   "targets": [{"host": "10.10.0.100", "ports": [3000], "kind": "http"}],
   "actions": [
     {"tool": "nmap", "args": ["-sV", "-p3000", "10.10.0.100"]},
-    {"tool": "nuclei", "args": ["-u", "http://10.10.0.100:3000", "-json", "-silent"]},
+    {"tool": "nuclei", "args": ["-u", "http://10.10.0.100:3000", "-jsonl", "-silent"  # nuclei v3 用 -jsonl（-json 已移除）]},
     {"tool": "curl_probe", "paths": ["/", "/robots.txt"]}
   ],
   "rate_limit": {"rps_per_host": 2, "max_requests_per_host": 50},
